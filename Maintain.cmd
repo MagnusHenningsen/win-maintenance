@@ -1,10 +1,18 @@
 <# : batch launcher - PowerShell sees this block as a comment
 @echo off
 rem Maintenance.cmd - single-file maintenance menu. Double-click to run.
-set "MAINT_SELF=%~f0"
-powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Expression ([IO.File]::ReadAllText($env:MAINT_SELF))"
-if errorlevel 1 pause
-exit /b
+rem Everything sits in one ( ) block: cmd parses the whole block up front, so git pull
+rem rewriting this file mid-run can't make cmd read half-old, half-new lines.
+(
+    set "MAINT_SELF=%~f0"
+    where git >nul 2>&1 && (
+        echo Checking for script updates...
+        git -C "%~dp0." -c safe.directory=* pull --ff-only --quiet https://github.com/MagnusHenningsen/win-maintenance.git main || echo Update skipped ^(offline, no remote, or local changes^).
+    )
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Expression ([IO.File]::ReadAllText($env:MAINT_SELF))"
+    if errorlevel 1 pause
+    exit /b
+)
 #>
 
 # Interactive maintenance menu: winget updates, system summary, disk cleanup,
