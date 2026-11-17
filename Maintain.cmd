@@ -42,6 +42,10 @@ setlocal EnableDelayedExpansion
 
 $ErrorActionPreference = 'Stop'
 
+# Bump on every deploy (commit + push to main). Shown at the top of the main menu.
+$ScriptVersion = '1.4'
+try { $Host.UI.RawUI.WindowTitle = "Maintenance v$ScriptVersion" } catch {}
+
 #region ---------- General helpers ----------
 
 function Test-IsAdmin {
@@ -1165,7 +1169,7 @@ function Restart-Elevated {
 
 while ($true) {
     Clear-Host
-    Write-Host '=== Maintenance ===' -ForegroundColor Cyan
+    Write-Host "=== Maintenance v$ScriptVersion ===" -ForegroundColor Cyan
     Write-Host ("Admin: {0}" -f $(if (Test-IsAdmin) { 'Yes' } else { 'No' })) -ForegroundColor DarkGray
     $pr = Get-PendingRebootReasons
     if ($pr.Count) { Write-Host ("Reboot pending: {0}" -f ($pr -join ', ')) -ForegroundColor Yellow }
