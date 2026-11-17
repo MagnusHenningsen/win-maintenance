@@ -7,18 +7,27 @@ rem Delayed expansion (!VAR!) is needed to read variables set inside the block.
 setlocal EnableDelayedExpansion
 (
     set "MAINT_SELF=%~f0"
-    where git >nul 2>&1 && (
-        echo Checking for script updates...
-        set "OLD=" & set "NEW="
-        for /f %%h in ('git -C "%~dp0." -c safe.directory^=* rev-parse --short HEAD 2^>nul') do set "OLD=%%h"
-        git -C "%~dp0." -c safe.directory=* pull --ff-only --quiet https://github.com/MagnusHenningsen/win-maintenance.git main || echo Update skipped ^(offline, no remote, or local changes^).
-        for /f %%h in ('git -C "%~dp0." -c safe.directory^=* rev-parse --short HEAD 2^>nul') do set "NEW=%%h"
-        if defined OLD if not "!OLD!"=="!NEW!" (
-            echo.
-            echo Script updated !OLD! -^> !NEW!:
-            git -C "%~dp0." -c safe.directory=* log --oneline !OLD!..!NEW!
-            echo.
-            timeout /t 5
+    rem "elevated" = relaunched as admin by this script: already updated, don't pull or elevate again.
+    if /i not "%~1"=="elevated" (
+        where git >nul 2>&1 && (
+            echo Checking for script updates...
+            set "OLD=" & set "NEW="
+            for /f %%h in ('git -C "%~dp0." -c safe.directory^=* rev-parse --short HEAD 2^>nul') do set "OLD=%%h"
+            git -C "%~dp0." -c safe.directory=* pull --ff-only --quiet https://github.com/MagnusHenningsen/win-maintenance.git main || echo Update skipped ^(offline, no remote, or local changes^).
+            for /f %%h in ('git -C "%~dp0." -c safe.directory^=* rev-parse --short HEAD 2^>nul') do set "NEW=%%h"
+            if defined OLD if not "!OLD!"=="!NEW!" (
+                echo.
+                echo Script updated !OLD! -^> !NEW!:
+                git -C "%~dp0." -c safe.directory=* log --oneline !OLD!..!NEW!
+                echo.
+                timeout /t 5
+            )
+        )
+        rem Ask for admin once here, so installs don't each trigger their own UAC prompt.
+        fltmc >nul 2>&1 || (
+            echo Asking for administrator rights...
+            powershell.exe -NoProfile -Command "Start-Process -FilePath $env:MAINT_SELF -ArgumentList 'elevated' -Verb RunAs" >nul 2>&1 && exit /b
+            echo Admin declined - continuing without admin.
         )
     )
     powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Expression ([IO.File]::ReadAllText($env:MAINT_SELF))"
@@ -717,7 +726,7 @@ function Invoke-WingetReinstall {
 
     for ($try = 1; $try -le 2; $try++) {
         Write-Host ">>> Installing $id (attempt $try)" -ForegroundColor Cyan
-        & winget install --id $id --exact @src --accept-package-agreements --accept-source-agreements
+        & winget install --id $id --exact @src --silent --accept-package-agreements --accept-source-agreements
         if ($LASTEXITCODE -eq 0) {
             Write-Host "$id reinstalled." -ForegroundColor Green
             $State.Reinstalled += $id
@@ -776,7 +785,8 @@ function Invoke-WingetUpgrade {
     param([object[]]$Packages, [switch]$All, [switch]$IncludeUnknown, [hashtable]$State)
     Assert-Winget
     if (-not $State) { $State = @{} }
-    $common = @('--accept-package-agreements', '--accept-source-agreements')
+    # --silent: no installer wizards (Next / I agree / Install)
+    $common = @('--silent', '--accept-package-agreements', '--accept-source-agreements')
 
     if ($All) {
         $a = @('upgrade', '--all') + $common
@@ -1145,7 +1155,7 @@ function Invoke-UpdateEverything {
 function Restart-Elevated {
     if (Test-IsAdmin) { Write-Host 'Already running as administrator.' -ForegroundColor Green; Wait-Enter; return }
     if (-not $env:MAINT_SELF) { Write-Host 'Launch via Maintenance.cmd to relaunch elevated.' -ForegroundColor Yellow; Wait-Enter; return }
-    Start-Process -FilePath $env:MAINT_SELF -Verb RunAs
+    Start-Process -FilePath $env:MAINT_SELF -ArgumentList 'elevated' -Verb RunAs
     exit 0
 }
 
