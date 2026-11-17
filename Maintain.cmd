@@ -3,11 +3,23 @@
 rem Maintenance.cmd - single-file maintenance menu. Double-click to run.
 rem Everything sits in one ( ) block: cmd parses the whole block up front, so git pull
 rem rewriting this file mid-run can't make cmd read half-old, half-new lines.
+rem Delayed expansion (!VAR!) is needed to read variables set inside the block.
+setlocal EnableDelayedExpansion
 (
     set "MAINT_SELF=%~f0"
     where git >nul 2>&1 && (
         echo Checking for script updates...
+        set "OLD=" & set "NEW="
+        for /f %%h in ('git -C "%~dp0." -c safe.directory^=* rev-parse --short HEAD 2^>nul') do set "OLD=%%h"
         git -C "%~dp0." -c safe.directory=* pull --ff-only --quiet https://github.com/MagnusHenningsen/win-maintenance.git main || echo Update skipped ^(offline, no remote, or local changes^).
+        for /f %%h in ('git -C "%~dp0." -c safe.directory^=* rev-parse --short HEAD 2^>nul') do set "NEW=%%h"
+        if defined OLD if not "!OLD!"=="!NEW!" (
+            echo.
+            echo Script updated !OLD! -^> !NEW!:
+            git -C "%~dp0." -c safe.directory=* log --oneline !OLD!..!NEW!
+            echo.
+            timeout /t 5
+        )
     )
     powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Expression ([IO.File]::ReadAllText($env:MAINT_SELF))"
     if errorlevel 1 pause
