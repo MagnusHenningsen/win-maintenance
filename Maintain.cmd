@@ -23,12 +23,6 @@ setlocal EnableDelayedExpansion
                 timeout /t 5
             )
         )
-        rem Ask for admin once here, so installs don't each trigger their own UAC prompt.
-        fltmc >nul 2>&1 || (
-            echo Asking for administrator rights...
-            powershell.exe -NoProfile -Command "Start-Process -FilePath $env:MAINT_SELF -ArgumentList 'elevated' -Verb RunAs" >nul 2>&1 && exit /b
-            echo Admin declined - continuing without admin.
-        )
     )
     powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Expression ([IO.File]::ReadAllText($env:MAINT_SELF))"
     if errorlevel 1 pause
@@ -43,7 +37,7 @@ setlocal EnableDelayedExpansion
 $ErrorActionPreference = 'Stop'
 
 # Bump on every deploy (commit + push to main). Shown at the top of the main menu.
-$ScriptVersion = '1.4'
+$ScriptVersion = '1.5'
 try { $Host.UI.RawUI.WindowTitle = "Maintenance v$ScriptVersion" } catch {}
 
 #region ---------- General helpers ----------
