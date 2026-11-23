@@ -8,6 +8,7 @@
 // Arguments:
 //   --elevated   started by "Run as administrator" (skip the update check)
 //   --no-update  restarted after an update (skip the update check)
+//   --auto       run by the scheduled task: automatic maintenance without a window
 using System;
 using System.Diagnostics;
 using System.IO;
@@ -17,8 +18,8 @@ using System.Windows.Forms;
 [assembly: AssemblyTitle("PC Maintenance")]
 [assembly: AssemblyProduct("PC Maintenance")]
 [assembly: AssemblyDescription("Keeps this PC up to date and tidy")]
-[assembly: AssemblyVersion("2.0.0.0")]
-[assembly: AssemblyFileVersion("2.0.0.0")]
+[assembly: AssemblyVersion("2.2.0.0")]
+[assembly: AssemblyFileVersion("2.2.0.0")]
 
 static class Launcher
 {
@@ -41,7 +42,8 @@ static class Launcher
         string extra = "";
         foreach (string a in args)
         {
-            if (a == "--elevated" || a == "--no-update") extra = " -NoUpdate";
+            if (a == "--elevated" || a == "--no-update") extra += " -NoUpdate";
+            if (a == "--auto") extra += " -Auto -NoUpdate";   // scheduled automatic maintenance, no window
         }
 
         string ps = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.System),
