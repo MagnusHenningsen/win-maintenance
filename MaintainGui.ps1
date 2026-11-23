@@ -1,0 +1,2489 @@
+<#
+  MaintainGui.ps1 - point-and-click version of Maintain.cmd for non-technical users.
+
+  Normally started by "PC Maintenance.exe" (built by build.ps1), which runs:
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File MaintainGui.ps1
+
+  Structure:
+    $EngineCode  - the actual maintenance work (winget, Windows Update, cleanup, powercfg...).
+                   Runs inside background runspaces so the window never freezes.
+                   Talks back with Log / SetStatus / Step (queued, drained by a UI timer).
+    UI           - WPF window built from XAML below. Long jobs show on the "task" page with
+                   a progress bar, one row per step, and a collapsible technical log.
+  Questions (restore point failed? reinstall failed apps?) are asked between stages on the
+  UI thread, never from inside a background job.
+#>
+param(
+    [switch]$NoUpdate,     # skip the git pull at startup (used after relaunching)
+    [string]$StartPage     # open a page directly: Apps, Clean, Battery, Sleep, Power, Info
+)
+
+$ErrorActionPreference = 'Stop'
+
+# Bump on every deploy (commit + push to main). Shown in the header.
+$AppVersion = '2.0'
+$AppDir     = $PSScriptRoot
+$SelfPath   = $PSCommandPath
+$RepoUrl    = 'https://github.com/MagnusHenningsen/win-maintenance.git'
+
+Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, System.Xaml
+
+#region ---------- Engine (runs in background runspaces; also dot-sourced into the UI) ----------
+
+$EngineCode = {
+$ErrorActionPreference = 'Stop'
+
+function Test-IsAdmin {
+    $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+    (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Format-Bytes([double]$B) {
+    if ($B -ge 1GB) { '{0:N1} GB' -f ($B / 1GB) }
+    elseif ($B -ge 1MB) { '{0:N0} MB' -f ($B / 1MB) }
+    elseif ($B -ge 1KB) { '{0:N0} KB' -f ($B / 1KB) }
+    else { '{0:N0} bytes' -f $B }
+}
+
+function Get-DesktopPath([string]$FileName) { Join-Path ([Environment]::GetFolderPath('Desktop')) $FileName }
+
+function Get-PendingRebootReasons {
+    $r = @()
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Component Based Servicing\RebootPending') { $r += 'Component servicing' }
+    if (Test-Path 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\WindowsUpdate\Auto Update\RebootRequired') { $r += 'Windows Update' }
+    $active  = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ActiveComputerName' -ErrorAction SilentlyContinue).ComputerName
+    $pending = (Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\ComputerName\ComputerName' -ErrorAction SilentlyContinue).ComputerName
+    if ($active -and $pending -and $active -ne $pending) { $r += 'Computer rename' }
+    $pfro = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager' -Name PendingFileRenameOperations -ErrorAction SilentlyContinue
+    if ($pfro -and $pfro.PendingFileRenameOperations) { $r += 'Pending file renames (often harmless)' }
+    return , @($r)
+}
+
+# Pending file renames alone are common and harmless, so they don't count as "restart needed".
+function Test-RebootNeeded { @(Get-PendingRebootReasons | Where-Object { $_ -notlike 'Pending file renames*' }).Count -gt 0 }
+
+function Get-BatteryInfo {
+    $w = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $w) { return $null }
+    $design = $null; $full = $null
+    try { $design = (Get-CimInstance -Namespace root/wmi -ClassName BatteryStaticData -ErrorAction Stop | Select-Object -First 1).DesignedCapacity } catch {}
+    try { $full = (Get-CimInstance -Namespace root/wmi -ClassName BatteryFullChargedCapacity -ErrorAction Stop | Select-Object -First 1).FullChargedCapacity } catch {}
+    if (-not ($design -and $full)) {
+        # root/wmi needs admin; the battery report works for everyone (takes a second or two)
+        $xmlPath = Join-Path $env:TEMP ('battery-{0}.xml' -f [guid]::NewGuid())
+        try {
+            $null = Get-NativeText powercfg @('/batteryreport', '/xml', '/output', $xmlPath)
+            $bat = @(([xml](Get-Content -LiteralPath $xmlPath -Raw)).BatteryReport.Batteries.Battery)[0]
+            if ($bat) { $design = [double]$bat.DesignCapacity; $full = [double]$bat.FullChargeCapacity }
+        } catch {
+        } finally { Remove-Item -LiteralPath $xmlPath -ErrorAction SilentlyContinue }
+    }
+    [pscustomobject]@{
+        Charge = [int]$w.EstimatedChargeRemaining
+        OnAC   = ($w.BatteryStatus -in 2, 3, 6, 7, 8, 9)
+        Design = $design
+        Full   = $full
+        Health = if ($design -and $full) { [math]::Min(100, [math]::Round(100 * $full / $design, 0)) } else { $null }
+    }
+}
+
+function Get-SystemDriveFree { ([IO.DriveInfo]::new($env:SystemDrive)).AvailableFreeSpace }
+function Get-SystemDriveSize { ([IO.DriveInfo]::new($env:SystemDrive)).TotalSize }
+
+function Get-FolderSize([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return [long]0 }
+    [long](Get-ChildItem -LiteralPath $Path -Recurse -File -Force -ErrorAction SilentlyContinue | Measure-Object Length -Sum).Sum
+}
+
+# winget draws download progress with full/shaded block characters
+$ProgressBarChars = '[' + [char]0x2588 + [char]0x2592 + ']'
+
+# Runs a console program, sends its output to the technical log, returns the exit code.
+# Spinner characters and progress bars are dropped; "[===  42.0%  ===]" style lines update the progress bar.
+function Invoke-Native {
+    param([Parameter(Mandatory)][string]$FilePath, [string[]]$ArgumentList = @(), [switch]$Utf8)
+    $ErrorActionPreference = 'Continue'   # PS 5.1 + 2>&1 + Stop would throw on the first stderr line
+    $prev = $null
+    if ($Utf8) { try { $prev = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {} }
+    try {
+        & $FilePath @ArgumentList 2>&1 | ForEach-Object {
+            $t = @("$_" -split "`r" | Where-Object { $_.Trim() }) | Select-Object -Last 1
+            if (-not $t) { return }
+            $t = $t.TrimEnd()
+            if ($t -match '^\s*[-\\|/]\s*$' -or $t -match $ProgressBarChars) { return }
+            if ($t -match '^\s*\[[=\s]*(\d+(?:[.,]\d+)?)%[=\s]*\]\s*$') {
+                SetStatus $Sync.Status ([double]($Matches[1] -replace ',', '.')); return
+            }
+            Log $t 'detail'
+        }
+    } finally {
+        if ($prev) { try { [Console]::OutputEncoding = $prev } catch {} }
+    }
+    return $LASTEXITCODE
+}
+
+function Get-NativeText([string]$FilePath, [string[]]$ArgumentList) {
+    $ErrorActionPreference = 'Continue'
+    ((& $FilePath @ArgumentList 2>&1 | ForEach-Object { "$_" }) -join "`n").Trim()
+}
+
+function Get-SystemSnapshot {
+    $os   = Get-CimInstance Win32_OperatingSystem
+    $cv   = Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $cs   = Get-CimInstance Win32_ComputerSystem
+    $cpu  = Get-CimInstance Win32_Processor | Select-Object -First 1
+    $bios = Get-CimInstance Win32_BIOS
+    $plan = ''
+    $s = Get-NativeText powercfg @('/getactivescheme')
+    if ($s -match '\(([^)]+)\)') { $plan = $Matches[1] }
+    [pscustomobject]@{
+        Computer      = $env:COMPUTERNAME
+        User          = "$env:USERDOMAIN\$env:USERNAME"
+        IsAdmin       = Test-IsAdmin
+        OS            = ('{0} {1}' -f $os.Caption, $cv.DisplayVersion).Trim()
+        Build         = '{0}.{1}' -f $os.BuildNumber, $cv.UBR
+        Model         = ('{0} {1}' -f $cs.Manufacturer, $cs.Model).Trim()
+        Serial        = "$($bios.SerialNumber)".Trim()
+        Cpu           = "$($cpu.Name)".Trim()
+        MemTotal      = [double]$os.TotalVisibleMemorySize * 1KB
+        MemFree       = [double]$os.FreePhysicalMemory * 1KB
+        LastBoot      = $os.LastBootUpTime
+        Uptime        = (Get-Date) - $os.LastBootUpTime
+        PowerPlan     = $plan
+        Battery       = Get-BatteryInfo
+        RebootReasons = Get-PendingRebootReasons
+        RebootNeeded  = Test-RebootNeeded
+        Disks         = @(Get-CimInstance Win32_LogicalDisk -Filter 'DriveType=3' | ForEach-Object {
+            [pscustomobject]@{ Drive = $_.DeviceID; Label = $_.VolumeName; Free = [double]$_.FreeSpace; Size = [double]$_.Size }
+        })
+    }
+}
+
+#--- Cleanup ---
+
+function Initialize-RecycleBinApi {
+    if ('MaintGui.RecycleBin' -as [type]) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace MaintGui {
+    public static class RecycleBin {
+        [StructLayout(LayoutKind.Sequential)]
+        public struct SHQUERYRBINFO { public int cbSize; public long i64Size; public long i64NumItems; }
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SHQueryRecycleBin(string pszRootPath, ref SHQUERYRBINFO info);
+        [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
+        static extern int SHEmptyRecycleBin(IntPtr hwnd, string pszRootPath, uint flags);
+        public static long[] Query() {
+            var i = new SHQUERYRBINFO();
+            i.cbSize = Marshal.SizeOf(typeof(SHQUERYRBINFO));
+            if (SHQueryRecycleBin(null, ref i) != 0) return new long[] { -1, -1 };
+            return new long[] { i.i64Size, i.i64NumItems };
+        }
+        // 7 = no confirmation | no progress UI | no sound
+        public static int Empty() { return SHEmptyRecycleBin(IntPtr.Zero, null, 7); }
+    }
+}
+'@
+}
+
+function Get-RecycleBinSize { Initialize-RecycleBinApi; [MaintGui.RecycleBin]::Query()[0] }
+function Clear-RecycleBinAll { Initialize-RecycleBinApi; [void][MaintGui.RecycleBin]::Empty() }
+
+# Deletes everything inside a folder (files in use are skipped). Returns bytes freed.
+function Clear-FolderContents([string]$Path) {
+    if (-not (Test-Path -LiteralPath $Path)) { return [long]0 }
+    $before = Get-FolderSize $Path
+    $items = @(Get-ChildItem -LiteralPath $Path -Force -ErrorAction SilentlyContinue)
+    for ($i = 0; $i -lt $items.Count; $i++) {
+        if ($i % 25 -eq 0) { SetStatus ('Removing files ({0} of {1})' -f $i, $items.Count) (100 * $i / $items.Count) }
+        try { Remove-Item -LiteralPath $items[$i].FullName -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    return [long][math]::Max(0, $before - (Get-FolderSize $Path))
+}
+
+$DeliveryCachePath = Join-Path $env:windir 'ServiceProfiles\NetworkService\AppData\Local\Microsoft\Windows\DeliveryOptimization\Cache'
+
+#--- Power settings ---
+
+function Get-PowerVal {
+    param([string]$Sub, [string]$Setting)
+    $raw  = Get-NativeText powercfg @('/qh', 'SCHEME_CURRENT', $Sub, $Setting)
+    $hits = [regex]::Matches($raw, ':\s*0x([0-9a-fA-F]+)\s*(\r?\n|$)')
+    if ($hits.Count -lt 2) { return [pscustomobject]@{ OK = $false; Raw = $raw } }
+    [pscustomobject]@{
+        OK  = $true
+        AC  = [Convert]::ToInt32($hits[$hits.Count - 2].Groups[1].Value, 16)
+        DC  = [Convert]::ToInt32($hits[$hits.Count - 1].Groups[1].Value, 16)
+        Raw = $raw
+    }
+}
+
+function Set-PowerVal {
+    param([string]$Sub, [string]$Setting, [int]$Value, [switch]$AC, [switch]$DC)
+    if ($AC) {
+        & powercfg /setacvalueindex SCHEME_CURRENT $Sub $Setting $Value
+        if ($LASTEXITCODE -ne 0) { throw "Could not change the setting (powercfg error $LASTEXITCODE)." }
+    }
+    if ($DC) {
+        & powercfg /setdcvalueindex SCHEME_CURRENT $Sub $Setting $Value
+        if ($LASTEXITCODE -ne 0) { throw "Could not change the setting (powercfg error $LASTEXITCODE)." }
+    }
+    & powercfg /setactive SCHEME_CURRENT
+}
+
+function Test-HibernateEnabled {
+    $v = Get-ItemProperty 'HKLM:\SYSTEM\CurrentControlSet\Control\Power' -Name HibernateEnabled -ErrorAction SilentlyContinue
+    return ($null -ne $v -and $v.HibernateEnabled -eq 1)
+}
+
+function Get-WakeArmedDevices {
+    @((Get-NativeText powercfg @('/devicequery', 'wake_armed')) -split "`n" | ForEach-Object { "$_".Trim() } |
+        Where-Object { $_ -and $_ -notmatch '^(NONE|INGEN|Ingen)$' })
+}
+
+#--- Restore point ---
+
+function Get-RestorePoints { @(Get-CimInstance -Namespace root/default -ClassName SystemRestore -ErrorAction SilentlyContinue) }
+
+function New-RestorePointCore {
+    param([string]$Description = 'PC Maintenance')
+    if (-not (Test-IsAdmin)) { return [pscustomobject]@{ Result = 'NeedsAdmin'; Detail = 'Needs administrator' } }
+    $before = @(Get-RestorePoints).Count
+    $r = Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName CreateRestorePoint -Arguments @{
+        Description      = $Description
+        RestorePointType = [uint32]12   # MODIFY_SETTINGS
+        EventType        = [uint32]100  # BEGIN_SYSTEM_CHANGE
+    }
+    if ($r.ReturnValue -ne 0) { return [pscustomobject]@{ Result = 'Failed'; Detail = "Error code $($r.ReturnValue)" } }
+    $points = @(Get-RestorePoints)
+    if ($points.Count -gt $before) { return [pscustomobject]@{ Result = 'Created'; Detail = 'Created' } }
+
+    # Windows only allows one restore point per 24 hours by default
+    $latest = $points | Sort-Object SequenceNumber | Select-Object -Last 1
+    if ($latest) {
+        try {
+            $t = [Management.ManagementDateTimeConverter]::ToDateTime($latest.CreationTime)
+            if ($t -gt (Get-Date).AddHours(-24)) {
+                return [pscustomobject]@{ Result = 'Recent'; Detail = ('Using the one from {0:dd MMM HH:mm} (Windows allows one per day)' -f $t) }
+            }
+        } catch {}
+    }
+    [pscustomobject]@{ Result = 'Failed'; Detail = 'Not created' }
+}
+
+function Enable-SystemProtectionCore {
+    $r = Invoke-CimMethod -Namespace root/default -ClassName SystemRestore -MethodName Enable -Arguments @{ Drive = "$env:SystemDrive\" }
+    if ($r.ReturnValue -ne 0) { throw "Could not turn on System Protection (code $($r.ReturnValue))." }
+}
+
+#--- winget ---
+
+function Assert-Winget {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        throw 'The Windows package manager (winget) is missing. Install "App Installer" from the Microsoft Store.'
+    }
+}
+
+function Get-WingetUpgrades {
+    param([switch]$IncludeUnknown)
+    Assert-Winget
+    SetStatus 'Checking which apps have updates'
+    $wgArgs = @('upgrade', '--accept-source-agreements')
+    if ($IncludeUnknown) { $wgArgs += '--include-unknown' }
+
+    $ErrorActionPreference = 'Continue'
+    $prev = $null
+    try { $prev = [Console]::OutputEncoding; [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+    try {
+        # Keep only the text after the last carriage return (drops the spinner)
+        $lines = @(& winget @wgArgs 2>$null | ForEach-Object { ("$_" -split "`r")[-1] })
+    } finally {
+        if ($prev) { try { [Console]::OutputEncoding = $prev } catch {} }
+    }
+
+    # Parse every table (normal + "require explicit targeting") by header column positions,
+    # so this works whatever language Windows is in.
+    $result = New-Object System.Collections.Generic.List[object]
+    for ($i = 1; $i -lt $lines.Count; $i++) {
+        if ($lines[$i] -notmatch '^-{10,}\s*$') { continue }
+        $cols = @([regex]::Matches($lines[$i - 1], '\S+') | ForEach-Object { $_.Index })
+        if ($cols.Count -lt 4) { continue }
+        $j = $i + 1
+        for (; $j -lt $lines.Count; $j++) {
+            $row = $lines[$j]
+            if ([string]::IsNullOrWhiteSpace($row) -or $row.Length -le $cols[3]) { break }
+            $f = for ($k = 0; $k -lt $cols.Count; $k++) {
+                $start = $cols[$k]
+                $end = if ($k + 1 -lt $cols.Count) { [Math]::Min($cols[$k + 1], $row.Length) } else { $row.Length }
+                if ($start -ge $row.Length) { '' } else { $row.Substring($start, $end - $start).Trim() }
+            }
+            if ($f[1] -notmatch '^\S+$') { break }
+            $result.Add([pscustomobject]@{
+                Name      = $f[0]
+                Id        = $f[1]
+                Version   = $f[2]
+                Available = $f[3]
+                Source    = if ($f.Count -gt 4) { $f[4] } else { '' }
+            })
+        }
+        $i = $j
+    }
+    return @($result | Sort-Object Id -Unique | Sort-Object Name)
+}
+
+$WingetCommon = @('--silent', '--accept-package-agreements', '--accept-source-agreements')
+
+# Upgrades packages one by one (Step per package Id). Returns the packages that still need an update.
+function Invoke-WingetUpgradeSet {
+    param([object[]]$Packages, [switch]$IncludeUnknown)
+    Assert-Winget
+    $n = $Packages.Count
+    for ($i = 0; $i -lt $n; $i++) {
+        $p = $Packages[$i]
+        Step $p.Id 'running' 'Updating...'
+        SetStatus ('Updating {0} ({1} of {2})' -f $p.Name, ($i + 1), $n) (100 * $i / $n)
+        Log ('Updating {0} [{1}] {2} -> {3}' -f $p.Name, $p.Id, $p.Version, $p.Available)
+        [void](Invoke-Native winget (@('upgrade', '--id', $p.Id, '--exact') + $WingetCommon) -Utf8)
+        Step $p.Id 'running' 'Checking...'
+    }
+    # Judge success by what's still listed, not exit codes (some installers return non-zero on success)
+    SetStatus 'Checking the results' 100
+    $still = @(Get-WingetUpgrades -IncludeUnknown:$IncludeUnknown | ForEach-Object { $_.Id })
+    $failed = @()
+    foreach ($p in $Packages) {
+        if ($still -contains $p.Id) { $failed += $p; Step $p.Id 'error' 'Could not be updated' }
+        else { Step $p.Id 'ok' ('Updated to {0}' -f $p.Available) }
+    }
+    return , $failed
+}
+
+# Uninstall + fresh install. Step key is "re:<Id>".
+function Invoke-WingetReinstallSet {
+    param([object[]]$Packages)
+    $lost = @(); $ok = 0
+    $n = $Packages.Count
+    for ($i = 0; $i -lt $n; $i++) {
+        $p = $Packages[$i]; $key = 're:' + $p.Id
+        $src = if ($p.Source) { @('--source', $p.Source) } else { @() }
+        Step $key 'running' 'Removing...'
+        SetStatus ('Reinstalling {0} ({1} of {2})' -f $p.Name, ($i + 1), $n) (100 * $i / $n)
+        Log "Uninstalling $($p.Id)"
+        $code = Invoke-Native winget @('uninstall', '--id', $p.Id, '--exact', '--silent', '--accept-source-agreements') -Utf8
+        if ($code -ne 0) { Step $key 'error' 'Could not remove it, so it was left as it was'; continue }
+
+        $done = $false
+        for ($try = 1; $try -le 2 -and -not $done; $try++) {
+            Step $key 'running' 'Installing...'
+            Log "Installing $($p.Id) (attempt $try)"
+            $code = Invoke-Native winget (@('install', '--id', $p.Id, '--exact') + $src + $WingetCommon) -Utf8
+            if ($code -eq 0) { $done = $true }
+        }
+        if ($done) { $ok++; Step $key 'ok' 'Reinstalled' }
+        else {
+            $lost += $p.Id
+            Step $key 'error' ('REMOVED and not reinstalled. Ask IT, or run: winget install --id {0}' -f $p.Id)
+        }
+    }
+    [pscustomobject]@{ Ok = $ok; Lost = $lost }
+}
+
+#--- Update everything ---
+
+$UpdateSteps = @(
+    [pscustomobject]@{ Key = 'winget';   Label = 'Apps';                         Fn = 'Update-AllApps';       Admin = $false }
+    [pscustomobject]@{ Key = 'store';    Label = 'Microsoft Store apps';         Fn = 'Update-StoreApps';     Admin = $true }
+    [pscustomobject]@{ Key = 'wu';       Label = 'Windows Update and drivers';   Fn = 'Update-WindowsUpdate'; Admin = $true }
+    [pscustomobject]@{ Key = 'defender'; Label = 'Virus protection (Defender)';  Fn = 'Update-Defender';      Admin = $true }
+    [pscustomobject]@{ Key = 'office';   Label = 'Microsoft 365 / Office';       Fn = 'Update-Office';        Admin = $false }
+    [pscustomobject]@{ Key = 'wsl';      Label = 'Windows Subsystem for Linux';  Fn = 'Update-Wsl';           Admin = $false }
+    [pscustomobject]@{ Key = 'psmod';    Label = 'PowerShell modules';           Fn = 'Update-PsModules';     Admin = $false }
+)
+
+function Update-AllApps {
+    param($ctx)
+    $pkgs = @(Get-WingetUpgrades -IncludeUnknown)
+    if (-not $pkgs.Count) { $ctx.Text = 'All apps are up to date'; return }
+    Log ('{0} app update(s) found' -f $pkgs.Count)
+    $failed = @(Invoke-WingetUpgradeSet -Packages $pkgs -IncludeUnknown)
+    $ctx.Out.Failed = $failed
+    if ($failed.Count) {
+        $ctx.State = 'warn'
+        $ctx.Text = '{0} of {1} updated, {2} could not be updated' -f ($pkgs.Count - $failed.Count), $pkgs.Count, $failed.Count
+    } else {
+        $ctx.Text = '{0} app(s) updated' -f $pkgs.Count
+    }
+}
+
+function Update-StoreApps {
+    param($ctx)
+    SetStatus 'Asking the Microsoft Store to check for updates'
+    $r = Get-CimInstance -Namespace 'root/cimv2/mdm/dmmap' -ClassName 'MDM_EnterpriseModernAppManagement_AppManagement01' |
+        Invoke-CimMethod -MethodName UpdateScanMethod
+    if ($r -and $r.ReturnValue -ne 0) { throw "The Store update check failed (code $($r.ReturnValue))." }
+    $ctx.Text = 'Started. The Store installs updates in the background'
+}
+
+function Update-WindowsUpdate {
+    param($ctx)
+    SetStatus 'Looking for Windows updates and drivers (this can take several minutes)'
+    $session  = New-Object -ComObject Microsoft.Update.Session
+    $searcher = $session.CreateUpdateSearcher()
+    $found    = $searcher.Search('IsInstalled=0 and IsHidden=0')
+
+    $list = @()
+    foreach ($u in $found.Updates) {
+        if ($u.InstallationBehavior.CanRequestUserInput) { Log "Skipped (needs manual install): $($u.Title)" 'detail'; continue }
+        if (-not $u.EulaAccepted) { $u.AcceptEula() }
+        Log "Found: $($u.Title)" 'detail'
+        $list += $u
+    }
+    $total = $list.Count
+    if ($total -eq 0) { $ctx.Text = 'Windows is up to date'; return }
+    Log ('{0} Windows update(s) found' -f $total)
+
+    $codes = @{ 0 = 'Not started'; 1 = 'In progress'; 2 = 'Succeeded'; 3 = 'Succeeded with errors'; 4 = 'Failed'; 5 = 'Aborted' }
+    $ok = 0; $failed = @(); $reboot = $false
+
+    for ($i = 0; $i -lt $total; $i++) {
+        $u = $list[$i]
+        SetStatus ('Downloading Windows update {0} of {1}' -f ($i + 1), $total) (50 * $i / $total)
+        if ($u.IsDownloaded) { continue }
+        $c = New-Object -ComObject Microsoft.Update.UpdateColl; [void]$c.Add($u)
+        $d = $session.CreateUpdateDownloader(); $d.Updates = $c
+        try { [void]$d.Download() } catch { Log "Download failed: $($u.Title)" 'warn' }
+    }
+    for ($i = 0; $i -lt $total; $i++) {
+        $u = $list[$i]
+        SetStatus ('Installing Windows update {0} of {1}' -f ($i + 1), $total) (50 + 50 * $i / $total)
+        if (-not $u.IsDownloaded) { $failed += $u.Title; continue }
+        $c = New-Object -ComObject Microsoft.Update.UpdateColl; [void]$c.Add($u)
+        $inst = $session.CreateUpdateInstaller(); $inst.Updates = $c
+        try {
+            $res = $inst.Install()
+            if ($res.RebootRequired) { $reboot = $true }
+            if ([int]$res.ResultCode -in 2, 3) { $ok++; Log "Installed: $($u.Title)" 'detail' }
+            else { $failed += $u.Title; Log ('{0}: {1}' -f $codes[[int]$res.ResultCode], $u.Title) 'warn' }
+        } catch {
+            $failed += $u.Title; Log "Install error: $($u.Title)" 'warn'
+        }
+    }
+    $ctx.Text = '{0} of {1} installed' -f $ok, $total
+    if ($failed.Count) { $ctx.State = 'warn'; $ctx.Text += ", $($failed.Count) failed" }
+    if ($reboot) { $ctx.Text += ', restart needed' }
+    if ($ok -eq 0) { throw $ctx.Text }
+}
+
+function Update-Defender {
+    param($ctx)
+    if (-not (Get-Command Update-MpSignature -ErrorAction SilentlyContinue)) { $ctx.State = 'skip'; $ctx.Text = 'Not available'; return }
+    SetStatus 'Updating virus definitions'
+    Update-MpSignature
+    $ctx.Text = 'Up to date'
+}
+
+function Update-Office {
+    param($ctx)
+    $c2r = Join-Path $env:CommonProgramFiles 'microsoft shared\ClickToRun\OfficeC2RClient.exe'
+    if (-not (Test-Path $c2r)) { $ctx.State = 'skip'; $ctx.Text = 'Not installed'; return }
+    Start-Process $c2r -ArgumentList '/update user updatepromptuser=false forceappshutdown=false displaylevel=true'
+    $ctx.Text = 'Office updater started in its own window'
+}
+
+function Update-Wsl {
+    param($ctx)
+    if (-not (Get-Command wsl.exe -ErrorAction SilentlyContinue) -or
+        -not (Test-Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss')) { $ctx.State = 'skip'; $ctx.Text = 'Not installed'; return }
+    SetStatus 'Updating WSL'
+    $env:WSL_UTF8 = '1'
+    $code = Invoke-Native wsl.exe @('--update') -Utf8
+    if ($code -ne 0) { throw "wsl --update failed (code $code)" }
+    $ctx.Text = 'Up to date'
+}
+
+# AzureRM and the classic Azure modules are retired (replaced by Az) and can't be updated from PSGallery.
+$RetiredModulePattern = '^(AzureRM(\..+)?|Azure|Azure\.Storage|Azure\.AnalysisServices)$'
+
+function Update-PsModules {
+    param($ctx)
+    SetStatus 'Looking for PowerShell modules'
+    $all = @(Get-InstalledModule -ErrorAction SilentlyContinue)
+    if (-not $all.Count) { $ctx.State = 'skip'; $ctx.Text = 'None installed'; return }
+    $retired = @($all | Where-Object { $_.Name -match $RetiredModulePattern })
+    $mods    = @($all | Where-Object { $_.Name -notmatch $RetiredModulePattern })
+    $failed  = @()
+    for ($i = 0; $i -lt $mods.Count; $i++) {
+        $m = $mods[$i]
+        SetStatus ('PowerShell module {0} of {1}: {2}' -f ($i + 1), $mods.Count, $m.Name) (100 * $i / [math]::Max(1, $mods.Count))
+        try { Update-Module -Name $m.Name -Force -ErrorAction Stop; Log "$($m.Name) ok" 'detail' }
+        catch { $failed += $m.Name; Log "$($m.Name) failed: $($_.Exception.Message)" 'warn' }
+    }
+    $ctx.Text = '{0} checked' -f $mods.Count
+    if ($failed.Count) {
+        $ctx.State = 'warn'
+        $shown = ($failed | Select-Object -First 3) -join ', '
+        if ($failed.Count -gt 3) { $shown += ", +$($failed.Count - 3) more" }
+        $ctx.Text += "; $($failed.Count) failed: $shown"
+    }
+    if ($retired.Count) {
+        $ctx.Out.Retired = @($retired | ForEach-Object { $_.Name })
+        $ctx.Text += "; $($retired.Count) retired Azure module(s) found"
+    }
+}
+
+function Remove-RetiredModules {
+    param([string[]]$Names)
+    $left = @($Names)
+    # Several passes: dependencies block removal until their dependents are gone
+    for ($pass = 1; $pass -le 3 -and $left.Count; $pass++) {
+        $next = @()
+        for ($i = 0; $i -lt $left.Count; $i++) {
+            SetStatus ('Removing {0} ({1} of {2})' -f $left[$i], ($i + 1), $left.Count) (100 * $i / $left.Count)
+            try { Uninstall-Module -Name $left[$i] -AllVersions -Force -ErrorAction Stop; Log "Removed $($left[$i])" 'detail' }
+            catch { $next += $left[$i] }
+        }
+        $left = $next
+    }
+    return , $left
+}
+}
+
+#endregion
+
+#region ---------- Background workers ----------
+
+# Every background job gets these, so engine code can report back to the window.
+$WorkerPrelude = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference = 'SilentlyContinue'
+function Log([string]$Message, [string]$Kind = 'info') {
+    $Sync.Queue.Enqueue([pscustomobject]@{ Type = 'log'; Text = $Message; Kind = $Kind })
+}
+function SetStatus([string]$Text, [double]$Percent = -1) {
+    $Sync.Status = $Text
+    if ($Percent -ge 0) { $Sync.Percent = $Sync.Base + [math]::Min(100, $Percent) * $Sync.Span / 100 }
+    elseif ($Sync.Span -lt 100) { $Sync.Percent = $Sync.Base }
+    else { $Sync.Percent = -1 }
+}
+function Step([string]$Key, [string]$State, [string]$Detail = '') {
+    $Sync.Queue.Enqueue([pscustomobject]@{ Type = 'step'; Key = $Key; State = $State; Detail = $Detail })
+}
+'@
+
+# UI-thread versions: engine helpers called directly from the window just do nothing with progress.
+. $EngineCode
+function Log { }
+function SetStatus { }
+function Step { }
+
+$script:Workers = New-Object System.Collections.ArrayList
+$script:Fg = $null           # the worker whose progress the task page shows
+$script:DialogDepth = 0
+
+function Start-Worker {
+    param(
+        [Parameter(Mandatory)][scriptblock]$Work,
+        [object[]]$ArgumentList = @(),
+        [scriptblock]$OnDone,
+        [switch]$Foreground
+    )
+    $sync = [hashtable]::Synchronized(@{
+        Queue   = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
+        Status  = ''
+        Percent = -1
+        Base    = 0
+        Span    = 100
+    })
+    $iss = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    $iss.Variables.Add((New-Object System.Management.Automation.Runspaces.SessionStateVariableEntry 'Sync', $sync, ''))
+    $rs = [runspacefactory]::CreateRunspace($iss)
+    $rs.Open()
+    $ps = [powershell]::Create()
+    $ps.Runspace = $rs
+    [void]$ps.AddScript($WorkerPrelude + "`n" + $EngineCode.ToString() + "`n& {`n" + $Work.ToString() + "`n} @args")
+    foreach ($a in $ArgumentList) { [void]$ps.AddArgument($a) }
+
+    $w = [pscustomobject]@{ PS = $ps; RS = $rs; Handle = $null; Sync = $sync; OnDone = $OnDone; Foreground = [bool]$Foreground }
+    $w.Handle = $ps.BeginInvoke()
+    [void]$script:Workers.Add($w)
+    if ($Foreground) { $script:Fg = $w }
+}
+
+# Called by a DispatcherTimer on the UI thread.
+function Invoke-WorkerTick {
+    foreach ($w in @($script:Workers)) {
+        $item = $null
+        while ($w.Sync.Queue.TryDequeue([ref]$item)) {
+            if ($w.Foreground) { Receive-TaskMessage $item }
+        }
+        if ($w.Foreground -and $script:Fg -eq $w) { Update-TaskProgress $w }
+
+        if (-not $w.Handle.IsCompleted) { continue }
+        if ($script:DialogDepth -gt 0) { continue }   # don't chain into new dialogs while one is open
+
+        $script:Workers.Remove($w)
+        $result = $null; $err = $null
+        try { $result = $w.PS.EndInvoke($w.Handle) }
+        catch {
+            $ex = $_.Exception
+            while ($ex.InnerException) { $ex = $ex.InnerException }
+            $err = $ex.Message
+        }
+        try { $w.PS.Dispose(); $w.RS.Dispose() } catch {}
+        if ($script:Fg -eq $w) { $script:Fg = $null }
+
+        if ($w.OnDone) {
+            $r = $null
+            if ($null -ne $result -and $result.Count -gt 0) { $r = $result[$result.Count - 1] }
+            try { & $w.OnDone $r $err } catch { Show-Error $_ }
+        }
+    }
+    if ($script:TaskBusy -and $script:TaskClock) {
+        $ui.TxtTaskElapsed.Text = 'Time so far: {0:hh\:mm\:ss}' -f $script:TaskClock.Elapsed
+    }
+}
+
+#endregion
+
+#region ---------- XAML ----------
+
+$ResourcesXaml = @'
+<ResourceDictionary xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+                    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+  <SolidColorBrush x:Key="Accent" Color="#0F6CBD"/>
+  <SolidColorBrush x:Key="AccentDark" Color="#0C5A9E"/>
+  <SolidColorBrush x:Key="AccentLight" Color="#EBF3FC"/>
+  <SolidColorBrush x:Key="Bg" Color="#F5F5F7"/>
+  <SolidColorBrush x:Key="Line" Color="#E1E1E6"/>
+  <SolidColorBrush x:Key="Text" Color="#1B1B1F"/>
+  <SolidColorBrush x:Key="Muted" Color="#5F5F6B"/>
+  <SolidColorBrush x:Key="Good" Color="#107C10"/>
+  <SolidColorBrush x:Key="Warn" Color="#9D5D00"/>
+  <SolidColorBrush x:Key="Bad" Color="#C42B1C"/>
+  <FontFamily x:Key="Icons">Segoe MDL2 Assets, Segoe UI Symbol</FontFamily>
+
+  <Style x:Key="Card" TargetType="Border">
+    <Setter Property="Background" Value="White"/>
+    <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="CornerRadius" Value="8"/>
+    <Setter Property="Padding" Value="18"/>
+  </Style>
+
+  <Style x:Key="Footer" TargetType="Border">
+    <Setter Property="Background" Value="White"/>
+    <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+    <Setter Property="BorderThickness" Value="0,1,0,0"/>
+    <Setter Property="Padding" Value="24,12"/>
+  </Style>
+
+  <Style x:Key="MutedText" TargetType="TextBlock">
+    <Setter Property="Foreground" Value="{StaticResource Muted}"/>
+    <Setter Property="TextWrapping" Value="Wrap"/>
+  </Style>
+
+  <Style x:Key="CardTitle" TargetType="TextBlock">
+    <Setter Property="FontSize" Value="16"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="Margin" Value="0,0,0,6"/>
+  </Style>
+
+  <Style x:Key="Mono" TargetType="TextBox">
+    <Setter Property="FontFamily" Value="Consolas"/>
+    <Setter Property="FontSize" Value="12"/>
+    <Setter Property="IsReadOnly" Value="True"/>
+    <Setter Property="BorderThickness" Value="0"/>
+    <Setter Property="Background" Value="#F7F7F9"/>
+    <Setter Property="Padding" Value="10"/>
+    <Setter Property="TextWrapping" Value="Wrap"/>
+    <Setter Property="Margin" Value="0,8,0,0"/>
+  </Style>
+
+  <Style x:Key="BtnBase" TargetType="Button">
+    <Setter Property="Foreground" Value="{StaticResource Text}"/>
+    <Setter Property="Background" Value="White"/>
+    <Setter Property="BorderBrush" Value="#CFCFD6"/>
+    <Setter Property="BorderThickness" Value="1"/>
+    <Setter Property="Padding" Value="16,8"/>
+    <Setter Property="FontSize" Value="14"/>
+    <Setter Property="Cursor" Value="Hand"/>
+    <Setter Property="HorizontalContentAlignment" Value="Center"/>
+    <Setter Property="VerticalContentAlignment" Value="Center"/>
+    <Setter Property="FocusVisualStyle" Value="{x:Null}"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="Button">
+          <Border x:Name="b" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}"
+                  BorderThickness="{TemplateBinding BorderThickness}" CornerRadius="6" Padding="{TemplateBinding Padding}"
+                  SnapsToDevicePixels="True">
+            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}"
+                              VerticalAlignment="{TemplateBinding VerticalContentAlignment}"/>
+          </Border>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsEnabled" Value="False"><Setter Property="Opacity" Value="0.45"/></Trigger>
+            <Trigger Property="IsKeyboardFocused" Value="True"><Setter TargetName="b" Property="BorderBrush" Value="{StaticResource Accent}"/></Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+    <Style.Triggers>
+      <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#F0F0F3"/></Trigger>
+      <Trigger Property="IsPressed" Value="True"><Setter Property="Background" Value="#E4E4E9"/></Trigger>
+    </Style.Triggers>
+  </Style>
+  <Style TargetType="Button" BasedOn="{StaticResource BtnBase}"/>
+
+  <Style x:Key="Primary" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+    <Setter Property="Background" Value="{StaticResource Accent}"/>
+    <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+    <Setter Property="Foreground" Value="White"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Style.Triggers>
+      <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="{StaticResource AccentDark}"/></Trigger>
+      <Trigger Property="IsPressed" Value="True"><Setter Property="Background" Value="#0A4A82"/></Trigger>
+    </Style.Triggers>
+  </Style>
+
+  <Style x:Key="Hero" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+    <Setter Property="Background" Value="White"/>
+    <Setter Property="BorderBrush" Value="White"/>
+    <Setter Property="Foreground" Value="{StaticResource Accent}"/>
+    <Setter Property="FontWeight" Value="SemiBold"/>
+    <Setter Property="FontSize" Value="15"/>
+    <Setter Property="Padding" Value="22,12"/>
+    <Style.Triggers>
+      <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#EBF3FC"/></Trigger>
+    </Style.Triggers>
+  </Style>
+
+  <Style x:Key="Ghost" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+    <Setter Property="Background" Value="Transparent"/>
+    <Setter Property="BorderBrush" Value="Transparent"/>
+    <Style.Triggers>
+      <Trigger Property="IsMouseOver" Value="True"><Setter Property="Background" Value="#E8E8EC"/></Trigger>
+    </Style.Triggers>
+  </Style>
+
+  <Style x:Key="Tile" TargetType="Button" BasedOn="{StaticResource BtnBase}">
+    <Setter Property="Padding" Value="18,16"/>
+    <Setter Property="BorderBrush" Value="{StaticResource Line}"/>
+    <Setter Property="HorizontalContentAlignment" Value="Stretch"/>
+    <Setter Property="VerticalContentAlignment" Value="Top"/>
+    <Setter Property="Margin" Value="0,0,12,12"/>
+    <Style.Triggers>
+      <Trigger Property="IsMouseOver" Value="True">
+        <Setter Property="Background" Value="#FAFCFF"/>
+        <Setter Property="BorderBrush" Value="{StaticResource Accent}"/>
+      </Trigger>
+    </Style.Triggers>
+  </Style>
+
+  <Style TargetType="ProgressBar">
+    <Setter Property="Height" Value="8"/>
+    <Setter Property="Foreground" Value="{StaticResource Accent}"/>
+    <Setter Property="Template">
+      <Setter.Value>
+        <ControlTemplate TargetType="ProgressBar">
+          <Grid ClipToBounds="True">
+            <Border x:Name="PART_Track" Background="#E1E1E6" CornerRadius="4"/>
+            <Border x:Name="PART_Indicator" Background="{TemplateBinding Foreground}" CornerRadius="4" HorizontalAlignment="Left"/>
+            <Border x:Name="Indet" Background="{TemplateBinding Foreground}" CornerRadius="4" Width="140"
+                    HorizontalAlignment="Left" Visibility="Collapsed">
+              <Border.RenderTransform><TranslateTransform X="-140"/></Border.RenderTransform>
+            </Border>
+          </Grid>
+          <ControlTemplate.Triggers>
+            <Trigger Property="IsIndeterminate" Value="True">
+              <Setter TargetName="PART_Indicator" Property="Visibility" Value="Collapsed"/>
+              <Setter TargetName="Indet" Property="Visibility" Value="Visible"/>
+              <Trigger.EnterActions>
+                <BeginStoryboard x:Name="Sweep">
+                  <Storyboard RepeatBehavior="Forever">
+                    <DoubleAnimation Storyboard.TargetName="Indet"
+                                     Storyboard.TargetProperty="(UIElement.RenderTransform).(TranslateTransform.X)"
+                                     From="-140" To="1400" Duration="0:0:2.2"/>
+                  </Storyboard>
+                </BeginStoryboard>
+              </Trigger.EnterActions>
+              <Trigger.ExitActions><StopStoryboard BeginStoryboardName="Sweep"/></Trigger.ExitActions>
+            </Trigger>
+          </ControlTemplate.Triggers>
+        </ControlTemplate>
+      </Setter.Value>
+    </Setter>
+  </Style>
+</ResourceDictionary>
+'@
+
+function Esc([string]$s) { ([Security.SecurityElement]::Escape([string]$s)) -replace "`r?`n", '&#10;' }
+
+$Tiles = @(
+    @{ Name = 'TileApps';    Glyph = 'E71D'; Title = 'App updates';     Desc = 'See which apps have updates and choose what to install.' }
+    @{ Name = 'TileClean';   Glyph = 'E74D'; Title = 'Free up space';   Desc = 'Remove temporary files and empty the Recycle Bin.' }
+    @{ Name = 'TileBattery'; Glyph = 'E83F'; Title = 'Battery health';  Desc = 'Check how well your battery still holds a charge.' }
+    @{ Name = 'TileSleep';   Glyph = 'E708'; Title = 'Sleep and wake';  Desc = "Find out why your PC wakes up by itself or won't sleep." }
+    @{ Name = 'TilePower';   Glyph = 'E7F8'; Title = 'Lid and sign-in'; Desc = 'Choose what closing the lid does and when a password is needed.' }
+    @{ Name = 'TileInfo';    Glyph = 'E7F4'; Title = 'About this PC';   Desc = 'Model, Windows version, memory and disks. Handy for IT support.' }
+    @{ Name = 'TileRestore'; Glyph = 'E777'; Title = 'Restore point';   Desc = 'Take a safety snapshot so system changes can be undone.' }
+    @{ Name = 'TileWU';      Glyph = 'E713'; Title = 'Windows Update';  Desc = 'Open the Windows Update page in Settings.' }
+)
+$TilesXaml = ($Tiles | ForEach-Object {
+@"
+        <Button x:Name="$($_.Name)" Style="{StaticResource Tile}">
+          <StackPanel>
+            <Border Width="40" Height="40" CornerRadius="8" Background="{StaticResource AccentLight}" HorizontalAlignment="Left">
+              <TextBlock FontFamily="{StaticResource Icons}" Text="&#x$($_.Glyph);" FontSize="20" Foreground="{StaticResource Accent}"
+                         HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <TextBlock Text="$(Esc $_.Title)" FontSize="15" FontWeight="SemiBold" Margin="0,12,0,0"/>
+            <TextBlock Text="$(Esc $_.Desc)" Style="{StaticResource MutedText}" FontSize="13" Margin="0,4,0,0"/>
+          </StackPanel>
+        </Button>
+"@
+}) -join "`n"
+
+$CleanItems = @(
+    [pscustomobject]@{ Key = 'usertemp'; Label = 'Temporary files';                 Admin = $false; Default = $true;  Desc = 'Leftovers from apps and installers. Safe to remove.' }
+    [pscustomobject]@{ Key = 'wintemp';  Label = 'Windows temporary files';         Admin = $true;  Default = $true;  Desc = 'Leftovers from Windows itself and system installers.' }
+    [pscustomobject]@{ Key = 'recycle';  Label = 'Recycle Bin';                     Admin = $false; Default = $false; Desc = "Files you have deleted. They can't be recovered afterwards." }
+    [pscustomobject]@{ Key = 'delivery'; Label = 'Update download cache';           Admin = $true;  Default = $true;  Desc = 'Copies of Windows updates that are already installed.' }
+    [pscustomobject]@{ Key = 'dism';     Label = 'Old versions of Windows components'; Admin = $true; Default = $false; Desc = 'Frees more space, but is slow (often 10 to 30 minutes).' }
+)
+$CleanXaml = ($CleanItems | ForEach-Object {
+@"
+          <Border BorderBrush="#EEEEF2" BorderThickness="0,0,0,1" Padding="18,14">
+            <DockPanel>
+              <TextBlock x:Name="TxtCleanSize_$($_.Key)" DockPanel.Dock="Right" VerticalAlignment="Center" FontWeight="SemiBold" Margin="16,0,0,0"/>
+              <CheckBox x:Name="ChkClean_$($_.Key)" VerticalContentAlignment="Center">
+                <StackPanel Margin="8,0,0,0">
+                  <TextBlock Text="$(Esc $_.Label)" FontWeight="SemiBold"/>
+                  <TextBlock x:Name="TxtCleanDesc_$($_.Key)" Text="$(Esc $_.Desc)" Style="{StaticResource MutedText}" FontSize="13"/>
+                </StackPanel>
+              </CheckBox>
+            </DockPanel>
+          </Border>
+"@
+}) -join "`n"
+
+$MainXaml = @"
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="PC Maintenance" Width="1060" Height="780" MinWidth="880" MinHeight="620"
+        WindowStartupLocation="CenterScreen" Background="{StaticResource Bg}"
+        FontFamily="Segoe UI" FontSize="14" Foreground="{StaticResource Text}"
+        UseLayoutRounding="True" TextOptions.TextFormattingMode="Display">
+  <Grid>
+    <Grid.RowDefinitions>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="Auto"/>
+      <RowDefinition Height="*"/>
+    </Grid.RowDefinitions>
+
+    <!-- Header -->
+    <Border Background="White" BorderBrush="{StaticResource Line}" BorderThickness="0,0,0,1" Padding="24,12">
+      <DockPanel>
+        <StackPanel DockPanel.Dock="Right" Orientation="Horizontal" VerticalAlignment="Center">
+          <Border x:Name="AdminBadge" Background="#DFF6DD" CornerRadius="14" Padding="12,5" Visibility="Collapsed">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock FontFamily="{StaticResource Icons}" Text="&#xEA18;" Foreground="{StaticResource Good}" VerticalAlignment="Center"/>
+              <TextBlock Text="Administrator" Foreground="{StaticResource Good}" FontWeight="SemiBold" Margin="6,0,0,0" FontSize="13"/>
+            </StackPanel>
+          </Border>
+          <Button x:Name="BtnElevate" Visibility="Collapsed" ToolTip="Some features need administrator rights. You may be asked for permission.">
+            <StackPanel Orientation="Horizontal">
+              <TextBlock FontFamily="{StaticResource Icons}" Text="&#xEA18;" Foreground="{StaticResource Accent}" VerticalAlignment="Center"/>
+              <TextBlock Text="Run as administrator" Margin="8,0,0,0"/>
+            </StackPanel>
+          </Button>
+        </StackPanel>
+        <StackPanel Orientation="Horizontal">
+          <Border Width="38" Height="38" CornerRadius="9" Background="{StaticResource Accent}">
+            <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE90F;" FontSize="20" Foreground="White"
+                       HorizontalAlignment="Center" VerticalAlignment="Center"/>
+          </Border>
+          <StackPanel Margin="12,0,0,0" VerticalAlignment="Center">
+            <TextBlock Text="PC Maintenance" FontSize="18" FontWeight="SemiBold"/>
+            <TextBlock x:Name="TxtVersion" FontSize="12" Foreground="{StaticResource Muted}"/>
+          </StackPanel>
+        </StackPanel>
+      </DockPanel>
+    </Border>
+
+    <!-- "New version downloaded" banner -->
+    <Border x:Name="Banner" Grid.Row="1" Visibility="Collapsed" Background="#EBF3FC" BorderBrush="#B4D6FA" BorderThickness="0,0,0,1" Padding="24,10">
+      <DockPanel>
+        <Button x:Name="BtnBanner" DockPanel.Dock="Right" Content="Restart app" Padding="14,6"/>
+        <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE946;" Foreground="{StaticResource Accent}" VerticalAlignment="Center" Margin="0,0,10,0"/>
+        <TextBlock x:Name="TxtBanner" VerticalAlignment="Center" TextWrapping="Wrap"/>
+      </DockPanel>
+    </Border>
+
+    <Grid Grid.Row="2">
+      <!-- ===== Home ===== -->
+      <ScrollViewer x:Name="PageHome" VerticalScrollBarVisibility="Auto">
+        <StackPanel Margin="24,20,12,16">
+          <Border CornerRadius="10" Padding="26,22" Margin="0,0,12,0">
+            <Border.Background>
+              <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                <GradientStop Color="#0F6CBD" Offset="0"/>
+                <GradientStop Color="#3A8EE0" Offset="1"/>
+              </LinearGradientBrush>
+            </Border.Background>
+            <DockPanel>
+              <Button x:Name="BtnUpdateAll" DockPanel.Dock="Right" Style="{StaticResource Hero}" VerticalAlignment="Center">
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE895;" VerticalAlignment="Center"/>
+                  <TextBlock Text="Update everything" Margin="10,0,0,0"/>
+                </StackPanel>
+              </Button>
+              <StackPanel Margin="0,0,24,0">
+                <TextBlock Text="Keep this PC up to date" FontSize="22" FontWeight="SemiBold" Foreground="White"/>
+                <TextBlock Foreground="#E6F0FA" TextWrapping="Wrap" Margin="0,6,0,0"
+                           Text="One click updates your apps, Windows and drivers, Microsoft Store apps, Office and virus protection."/>
+              </StackPanel>
+            </DockPanel>
+          </Border>
+
+          <TextBlock Text="Status" FontSize="16" FontWeight="SemiBold" Margin="0,22,0,10"/>
+          <UniformGrid Columns="4">
+            <Border Style="{StaticResource Card}" Margin="0,0,12,12">
+              <StackPanel>
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock FontFamily="{StaticResource Icons}" Text="&#xEDA2;" Foreground="{StaticResource Muted}" VerticalAlignment="Center"/>
+                  <TextBlock Text="Disk space" Foreground="{StaticResource Muted}" FontSize="13" Margin="8,0,0,0"/>
+                </StackPanel>
+                <TextBlock x:Name="TxtDiskMain" Text="..." FontSize="20" FontWeight="SemiBold" Margin="0,10,0,8"/>
+                <ProgressBar x:Name="DiskBar" Height="6" Maximum="100"/>
+                <TextBlock x:Name="TxtDiskSub" Style="{StaticResource MutedText}" FontSize="13" Margin="0,8,0,0"/>
+              </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}" Margin="0,0,12,12">
+              <StackPanel>
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE83F;" Foreground="{StaticResource Muted}" VerticalAlignment="Center"/>
+                  <TextBlock Text="Battery" Foreground="{StaticResource Muted}" FontSize="13" Margin="8,0,0,0"/>
+                </StackPanel>
+                <TextBlock x:Name="TxtBatMain" Text="..." FontSize="20" FontWeight="SemiBold" Margin="0,10,0,0"/>
+                <TextBlock x:Name="TxtBatSub" Style="{StaticResource MutedText}" FontSize="13" Margin="0,8,0,0"/>
+              </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}" Margin="0,0,12,12">
+              <StackPanel>
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE7E8;" Foreground="{StaticResource Muted}" VerticalAlignment="Center"/>
+                  <TextBlock Text="Restart" Foreground="{StaticResource Muted}" FontSize="13" Margin="8,0,0,0"/>
+                </StackPanel>
+                <TextBlock x:Name="TxtRebootMain" Text="..." FontSize="20" FontWeight="SemiBold" Margin="0,10,0,0"/>
+                <TextBlock x:Name="TxtRebootSub" Style="{StaticResource MutedText}" FontSize="13" Margin="0,8,0,0"/>
+                <Button x:Name="BtnRestartHome" Content="Restart now" HorizontalAlignment="Left" Padding="12,5" Margin="0,10,0,0" Visibility="Collapsed"/>
+              </StackPanel>
+            </Border>
+            <Border Style="{StaticResource Card}" Margin="0,0,12,12">
+              <StackPanel>
+                <StackPanel Orientation="Horizontal">
+                  <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE823;" Foreground="{StaticResource Muted}" VerticalAlignment="Center"/>
+                  <TextBlock Text="Running for" Foreground="{StaticResource Muted}" FontSize="13" Margin="8,0,0,0"/>
+                </StackPanel>
+                <TextBlock x:Name="TxtUpMain" Text="..." FontSize="20" FontWeight="SemiBold" Margin="0,10,0,0"/>
+                <TextBlock x:Name="TxtUpSub" Style="{StaticResource MutedText}" FontSize="13" Margin="0,8,0,0"/>
+              </StackPanel>
+            </Border>
+          </UniformGrid>
+
+          <TextBlock Text="Tools" FontSize="16" FontWeight="SemiBold" Margin="0,12,0,10"/>
+          <UniformGrid Columns="4">
+$TilesXaml
+          </UniformGrid>
+        </StackPanel>
+      </ScrollViewer>
+
+      <!-- ===== Sub pages ===== -->
+      <DockPanel x:Name="PageSub" Visibility="Collapsed">
+        <Border DockPanel.Dock="Top" Padding="14,14,24,8">
+          <DockPanel>
+            <Button x:Name="BtnBack" Style="{StaticResource Ghost}" VerticalAlignment="Top" Padding="10,9" Margin="0,0,8,0" ToolTip="Back">
+              <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE72B;" FontSize="16"/>
+            </Button>
+            <StackPanel>
+              <TextBlock x:Name="TxtPageTitle" FontSize="24" FontWeight="SemiBold"/>
+              <TextBlock x:Name="TxtPageSub" Style="{StaticResource MutedText}" Margin="0,2,0,0"/>
+            </StackPanel>
+          </DockPanel>
+        </Border>
+        <Grid>
+
+          <!-- App updates -->
+          <DockPanel x:Name="PanelApps" Visibility="Collapsed">
+            <Border DockPanel.Dock="Bottom" Style="{StaticResource Footer}">
+              <DockPanel>
+                <Button x:Name="BtnAppsUpdate" DockPanel.Dock="Right" Style="{StaticResource Primary}" Content="Update selected"/>
+                <StackPanel Orientation="Horizontal">
+                  <Button x:Name="BtnAppsSelect" Content="Select none"/>
+                  <Button x:Name="BtnAppsRefresh" Margin="8,0,0,0">
+                    <StackPanel Orientation="Horizontal">
+                      <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE72C;" VerticalAlignment="Center"/>
+                      <TextBlock Text="Check again" Margin="8,0,0,0"/>
+                    </StackPanel>
+                  </Button>
+                  <CheckBox x:Name="ChkAppsUnknown" VerticalAlignment="Center" Margin="16,0,0,0"
+                            Content="Include apps with an unknown version"
+                            ToolTip="Some apps don't report their version. They may show up as 'needs update' every time."/>
+                </StackPanel>
+              </DockPanel>
+            </Border>
+            <Grid Margin="24,8,24,16">
+              <StackPanel x:Name="AppsLoading" VerticalAlignment="Center" HorizontalAlignment="Center">
+                <TextBlock Text="Checking for app updates..." FontSize="16" HorizontalAlignment="Center"/>
+                <ProgressBar IsIndeterminate="True" Width="260" Margin="0,14,0,0"/>
+              </StackPanel>
+              <StackPanel x:Name="AppsEmpty" VerticalAlignment="Center" HorizontalAlignment="Center" Visibility="Collapsed" MaxWidth="520">
+                <TextBlock x:Name="AppsEmptyIcon" FontFamily="{StaticResource Icons}" FontSize="44" HorizontalAlignment="Center"/>
+                <TextBlock x:Name="AppsEmptyTitle" FontSize="20" FontWeight="SemiBold" HorizontalAlignment="Center" Margin="0,14,0,0" TextAlignment="Center" TextWrapping="Wrap"/>
+                <TextBlock x:Name="AppsEmptyText" Style="{StaticResource MutedText}" HorizontalAlignment="Center" TextAlignment="Center" Margin="0,6,0,0"/>
+              </StackPanel>
+              <Border x:Name="AppsCard" Style="{StaticResource Card}" Padding="0" Visibility="Collapsed">
+                <DockPanel>
+                  <Border DockPanel.Dock="Top" BorderBrush="#EEEEF2" BorderThickness="0,0,0,1" Padding="18,10">
+                    <Grid TextElement.Foreground="{StaticResource Muted}" TextElement.FontSize="12">
+                      <Grid.ColumnDefinitions>
+                        <ColumnDefinition Width="30"/><ColumnDefinition Width="*"/><ColumnDefinition Width="170"/><ColumnDefinition Width="170"/>
+                      </Grid.ColumnDefinitions>
+                      <TextBlock Grid.Column="1" Text="APP"/>
+                      <TextBlock Grid.Column="2" Text="YOU HAVE"/>
+                      <TextBlock Grid.Column="3" Text="NEW VERSION"/>
+                    </Grid>
+                  </Border>
+                  <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <StackPanel x:Name="AppsList"/>
+                  </ScrollViewer>
+                </DockPanel>
+              </Border>
+            </Grid>
+          </DockPanel>
+
+          <!-- Free up space -->
+          <DockPanel x:Name="PanelClean" Visibility="Collapsed">
+            <Border DockPanel.Dock="Bottom" Style="{StaticResource Footer}">
+              <DockPanel>
+                <Button x:Name="BtnCleanRun" DockPanel.Dock="Right" Style="{StaticResource Primary}" Content="Clean up selected"/>
+                <Button x:Name="BtnCleanMgr" Content="Open Windows Disk Cleanup" HorizontalAlignment="Left"/>
+              </DockPanel>
+            </Border>
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <StackPanel Margin="24,8,24,24">
+                <Border Style="{StaticResource Card}" Margin="0,0,0,12">
+                  <StackPanel>
+                    <DockPanel>
+                      <TextBlock x:Name="TxtCleanFree" DockPanel.Dock="Right" Foreground="{StaticResource Muted}"/>
+                      <TextBlock x:Name="TxtCleanDrive" FontWeight="SemiBold"/>
+                    </DockPanel>
+                    <ProgressBar x:Name="CleanBar" Height="10" Margin="0,10,0,0" Maximum="100"/>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}" Padding="0">
+                  <StackPanel>
+$CleanXaml
+                  </StackPanel>
+                </Border>
+                <TextBlock x:Name="TxtCleanAdminNote" Style="{StaticResource MutedText}" Margin="2,12,0,0" Visibility="Collapsed"
+                           Text="Some items need administrator rights. Use 'Run as administrator' at the top to include them."/>
+              </StackPanel>
+            </ScrollViewer>
+          </DockPanel>
+
+          <!-- Battery -->
+          <ScrollViewer x:Name="PanelBattery" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
+            <StackPanel Margin="24,8,24,24" MaxWidth="900" HorizontalAlignment="Left">
+              <TextBlock x:Name="TxtBatLoading" Text="Reading battery information..." Style="{StaticResource MutedText}"/>
+              <StackPanel x:Name="BatContent" Visibility="Collapsed">
+                <UniformGrid Columns="2">
+                  <Border Style="{StaticResource Card}" Margin="0,0,12,12">
+                    <StackPanel>
+                      <TextBlock Text="Charge right now" Foreground="{StaticResource Muted}" FontSize="13"/>
+                      <TextBlock x:Name="TxtBatCharge" FontSize="40" FontWeight="SemiBold" Margin="0,4,0,8"/>
+                      <ProgressBar x:Name="BatChargeBar" Height="10" Maximum="100"/>
+                      <TextBlock x:Name="TxtBatSource" Style="{StaticResource MutedText}" Margin="0,10,0,0"/>
+                    </StackPanel>
+                  </Border>
+                  <Border Style="{StaticResource Card}" Margin="0,0,0,12">
+                    <StackPanel>
+                      <TextBlock Text="Battery health" Foreground="{StaticResource Muted}" FontSize="13"/>
+                      <TextBlock x:Name="TxtBatHealth" FontSize="40" FontWeight="SemiBold" Margin="0,4,0,8"/>
+                      <ProgressBar x:Name="BatHealthBar" Height="10" Maximum="100"/>
+                      <TextBlock x:Name="TxtBatCap" Style="{StaticResource MutedText}" Margin="0,10,0,0"/>
+                    </StackPanel>
+                  </Border>
+                </UniformGrid>
+                <Border x:Name="BatVerdict" CornerRadius="8" Padding="16" BorderThickness="1">
+                  <DockPanel>
+                    <TextBlock x:Name="BatVerdictIcon" FontFamily="{StaticResource Icons}" FontSize="20" VerticalAlignment="Top" Margin="0,0,12,0"/>
+                    <TextBlock x:Name="TxtBatVerdict" TextWrapping="Wrap" VerticalAlignment="Center"/>
+                  </DockPanel>
+                </Border>
+                <TextBlock Style="{StaticResource MutedText}" Margin="2,14,0,0"
+                           Text="Health compares how much energy the battery can hold today with how much it held when it was new. All batteries slowly wear out. Below about 80% you'll notice it doesn't last as long as it used to."/>
+                <Button x:Name="BtnBatReport" HorizontalAlignment="Left" Margin="0,18,0,0">
+                  <StackPanel Orientation="Horizontal">
+                    <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE9F9;" VerticalAlignment="Center"/>
+                    <TextBlock Text="Create detailed battery report" Margin="8,0,0,0"/>
+                  </StackPanel>
+                </Button>
+              </StackPanel>
+            </StackPanel>
+          </ScrollViewer>
+
+          <!-- Sleep and wake -->
+          <DockPanel x:Name="PanelSleep" Visibility="Collapsed">
+            <Border DockPanel.Dock="Bottom" Style="{StaticResource Footer}">
+              <DockPanel>
+                <Button x:Name="BtnSleepStudy" DockPanel.Dock="Right" Content="Create sleep report"
+                        ToolTip="A detailed report of the last few days of sleep (Modern Standby PCs only). Needs administrator rights."/>
+                <Button x:Name="BtnSleepRefresh" HorizontalAlignment="Left">
+                  <StackPanel Orientation="Horizontal">
+                    <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE72C;" VerticalAlignment="Center"/>
+                    <TextBlock Text="Refresh" Margin="8,0,0,0"/>
+                  </StackPanel>
+                </Button>
+              </DockPanel>
+            </Border>
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <StackPanel Margin="24,8,24,24">
+                <TextBlock x:Name="TxtSleepLoading" Text="Reading sleep information..." Style="{StaticResource MutedText}"/>
+                <StackPanel x:Name="SleepContent" Visibility="Collapsed">
+                  <Border Style="{StaticResource Card}" Margin="0,0,0,12">
+                    <StackPanel>
+                      <TextBlock Text="What woke your PC last time" Style="{StaticResource CardTitle}"/>
+                      <TextBox x:Name="TxtLastWake" Style="{StaticResource Mono}"/>
+                    </StackPanel>
+                  </Border>
+                  <Border Style="{StaticResource Card}" Margin="0,0,0,12">
+                    <StackPanel>
+                      <TextBlock Text="Devices that can wake your PC" Style="{StaticResource CardTitle}"/>
+                      <TextBlock Style="{StaticResource MutedText}" Text="A mouse, keyboard or network adapter can wake the PC from sleep. If your PC keeps waking up by itself, stop the device that woke it."/>
+                      <StackPanel x:Name="WakeDevices" Margin="0,10,0,0"/>
+                    </StackPanel>
+                  </Border>
+                  <StackPanel x:Name="SleepAdmin">
+                    <Border Style="{StaticResource Card}" Margin="0,0,0,12">
+                      <StackPanel>
+                        <TextBlock Text="Scheduled wake-ups" Style="{StaticResource CardTitle}"/>
+                        <TextBlock Style="{StaticResource MutedText}" Text="Programs or Windows tasks that have asked to wake the PC at a certain time."/>
+                        <TextBox x:Name="TxtWakeTimers" Style="{StaticResource Mono}"/>
+                      </StackPanel>
+                    </Border>
+                    <Border Style="{StaticResource Card}" Margin="0,0,0,12">
+                      <StackPanel>
+                        <TextBlock Text="What's keeping your PC awake right now" Style="{StaticResource CardTitle}"/>
+                        <TextBlock Style="{StaticResource MutedText}" Text="Anything listed here (a video call, media playing, a download) can stop the PC from going to sleep."/>
+                        <TextBox x:Name="TxtRequests" Style="{StaticResource Mono}"/>
+                      </StackPanel>
+                    </Border>
+                  </StackPanel>
+                  <TextBlock x:Name="TxtSleepAdminNote" Style="{StaticResource MutedText}" Margin="2,0,0,0"
+                             Text="Run as administrator to also see scheduled wake-ups and what's keeping the PC awake, and to stop devices from waking it."/>
+                </StackPanel>
+              </StackPanel>
+            </ScrollViewer>
+          </DockPanel>
+
+          <!-- Lid and sign-in -->
+          <DockPanel x:Name="PanelPower" Visibility="Collapsed">
+            <Border DockPanel.Dock="Bottom" Style="{StaticResource Footer}">
+              <DockPanel>
+                <Button x:Name="BtnPowerSave" DockPanel.Dock="Right" Style="{StaticResource Primary}" Content="Save changes"/>
+                <StackPanel x:Name="PowerSaved" Orientation="Horizontal" VerticalAlignment="Center" Visibility="Collapsed">
+                  <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE73E;" Foreground="{StaticResource Good}" VerticalAlignment="Center"/>
+                  <TextBlock Text="Saved" Foreground="{StaticResource Good}" FontWeight="SemiBold" Margin="8,0,0,0"/>
+                </StackPanel>
+              </DockPanel>
+            </Border>
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <StackPanel Margin="24,8,24,24" MaxWidth="760" HorizontalAlignment="Left">
+                <Border x:Name="CardLid" Style="{StaticResource Card}" Margin="0,0,0,12">
+                  <StackPanel>
+                    <TextBlock Text="When I close the lid" Style="{StaticResource CardTitle}"/>
+                    <TextBlock Style="{StaticResource MutedText}" Text="'Sleep' is a good choice for most people: the PC wakes up quickly where you left off."/>
+                    <Grid Margin="0,14,0,0">
+                      <Grid.ColumnDefinitions><ColumnDefinition Width="160"/><ColumnDefinition Width="240"/></Grid.ColumnDefinitions>
+                      <Grid.RowDefinitions><RowDefinition/><RowDefinition/></Grid.RowDefinitions>
+                      <TextBlock Text="Plugged in" VerticalAlignment="Center"/>
+                      <ComboBox x:Name="CmbLidAC" Grid.Column="1" Padding="8,6">
+                        <ComboBoxItem Content="Do nothing"/><ComboBoxItem Content="Sleep"/><ComboBoxItem Content="Hibernate"/><ComboBoxItem Content="Shut down"/>
+                      </ComboBox>
+                      <TextBlock Grid.Row="1" Text="On battery" VerticalAlignment="Center" Margin="0,10,0,0"/>
+                      <ComboBox x:Name="CmbLidDC" Grid.Row="1" Grid.Column="1" Padding="8,6" Margin="0,10,0,0">
+                        <ComboBoxItem Content="Do nothing"/><ComboBoxItem Content="Sleep"/><ComboBoxItem Content="Hibernate"/><ComboBoxItem Content="Shut down"/>
+                      </ComboBox>
+                    </Grid>
+                  </StackPanel>
+                </Border>
+                <Border x:Name="CardNoLid" Style="{StaticResource Card}" Margin="0,0,0,12" Visibility="Collapsed">
+                  <TextBlock Style="{StaticResource MutedText}" Text="This PC doesn't have a lid setting (it's probably a desktop PC)."/>
+                </Border>
+                <Border Style="{StaticResource Card}">
+                  <StackPanel>
+                    <TextBlock Text="Ask for my password after sleep" Style="{StaticResource CardTitle}"/>
+                    <TextBlock Style="{StaticResource MutedText}" Text="When this is on, you have to sign in again when the PC wakes up. This keeps your files safe if someone else opens your PC."/>
+                    <ComboBox x:Name="CmbSignIn" Width="240" HorizontalAlignment="Left" Margin="0,14,0,0" Padding="8,6">
+                      <ComboBoxItem Content="Yes, every time"/><ComboBoxItem Content="No, never"/>
+                    </ComboBox>
+                    <TextBlock x:Name="TxtSignInNote" Style="{StaticResource MutedText}" FontSize="12" Margin="0,8,0,0"/>
+                  </StackPanel>
+                </Border>
+              </StackPanel>
+            </ScrollViewer>
+          </DockPanel>
+
+          <!-- About this PC -->
+          <DockPanel x:Name="PanelInfo" Visibility="Collapsed">
+            <Border DockPanel.Dock="Bottom" Style="{StaticResource Footer}">
+              <DockPanel>
+                <Button x:Name="BtnInfoCopy" DockPanel.Dock="Right" Style="{StaticResource Primary}">
+                  <StackPanel Orientation="Horizontal">
+                    <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE8C8;" VerticalAlignment="Center"/>
+                    <TextBlock x:Name="TxtInfoCopy" Text="Copy details" Margin="8,0,0,0"/>
+                  </StackPanel>
+                </Button>
+                <TextBlock Style="{StaticResource MutedText}" VerticalAlignment="Center" Text="Tip: paste the details into a message when you contact IT support."/>
+              </DockPanel>
+            </Border>
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <StackPanel Margin="24,8,24,24">
+                <TextBlock x:Name="TxtInfoLoading" Text="Reading PC information..." Style="{StaticResource MutedText}"/>
+                <Border x:Name="InfoCard" Style="{StaticResource Card}" Visibility="Collapsed" Padding="18,8">
+                  <StackPanel x:Name="InfoRows"/>
+                </Border>
+                <TextBlock x:Name="InfoDisksTitle" Text="Disks" Style="{StaticResource CardTitle}" Margin="0,18,0,8" Visibility="Collapsed"/>
+                <StackPanel x:Name="InfoDisks"/>
+              </StackPanel>
+            </ScrollViewer>
+          </DockPanel>
+
+          <!-- Running task -->
+          <DockPanel x:Name="PanelTask" Visibility="Collapsed">
+            <Border DockPanel.Dock="Bottom" Style="{StaticResource Footer}">
+              <DockPanel>
+                <Button x:Name="BtnTaskDone" DockPanel.Dock="Right" Style="{StaticResource Primary}" Content="Done" MinWidth="110"/>
+                <TextBlock x:Name="TxtTaskHint" Style="{StaticResource MutedText}" VerticalAlignment="Center"
+                           Text="You can keep using your PC while this runs. Please keep this window open."/>
+              </DockPanel>
+            </Border>
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+              <StackPanel Margin="24,8,24,24">
+                <Border x:Name="TaskResult" CornerRadius="8" Padding="18,16" Margin="0,0,0,12" BorderThickness="1" Visibility="Collapsed">
+                  <DockPanel>
+                    <Button x:Name="BtnTaskRestart" DockPanel.Dock="Right" Content="Restart now" VerticalAlignment="Center" Visibility="Collapsed" Margin="16,0,0,0"/>
+                    <TextBlock x:Name="TaskResultIcon" FontFamily="{StaticResource Icons}" FontSize="24" VerticalAlignment="Top" Margin="0,2,14,0"/>
+                    <StackPanel>
+                      <TextBlock x:Name="TxtResultTitle" FontSize="17" FontWeight="SemiBold"/>
+                      <TextBlock x:Name="TxtResultMsg" TextWrapping="Wrap" Margin="0,4,0,0"/>
+                    </StackPanel>
+                  </DockPanel>
+                </Border>
+                <Border x:Name="TaskProgressCard" Style="{StaticResource Card}">
+                  <StackPanel>
+                    <TextBlock x:Name="TxtTaskStatus" FontSize="16" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+                    <ProgressBar x:Name="TaskBar" Margin="0,14,0,10" Maximum="100"/>
+                    <TextBlock x:Name="TxtTaskElapsed" Foreground="{StaticResource Muted}" FontSize="12"/>
+                  </StackPanel>
+                </Border>
+                <Border Style="{StaticResource Card}" Margin="0,12,0,0" Padding="18,10">
+                  <StackPanel x:Name="TaskSteps"/>
+                </Border>
+                <Expander Header="Show technical details" Margin="0,14,0,0" Foreground="{StaticResource Muted}">
+                  <TextBox x:Name="TxtTaskLog" Style="{StaticResource Mono}" Height="280" TextWrapping="NoWrap"
+                           VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Auto" Foreground="{StaticResource Text}"/>
+                </Expander>
+              </StackPanel>
+            </ScrollViewer>
+          </DockPanel>
+
+        </Grid>
+      </DockPanel>
+    </Grid>
+  </Grid>
+</Window>
+"@
+
+#endregion
+
+#region ---------- UI helpers ----------
+
+$BrushConv = New-Object System.Windows.Media.BrushConverter
+function Get-Brush([string]$Color) { $BrushConv.ConvertFromString($Color) }
+
+$Colors = @{ Accent = '#0F6CBD'; Good = '#107C10'; Warn = '#9D5D00'; Bad = '#C42B1C'; Muted = '#5F5F6B'; Faint = '#9A9AA5' }
+
+function New-Xaml([string]$Xml) {
+    $Xml = $Xml -replace '^\s*<(\w+)', '<$1 xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"'
+    [Windows.Markup.XamlReader]::Parse($Xml)
+}
+
+function Format-Duration([TimeSpan]$t) {
+    if ($t.TotalDays -ge 1) { $n = [int][math]::Floor($t.TotalDays); return "$n day$(if ($n -ne 1) { 's' })" }
+    if ($t.TotalHours -ge 1) { $n = [int][math]::Floor($t.TotalHours); return "$n hour$(if ($n -ne 1) { 's' })" }
+    $n = [int][math]::Floor($t.TotalMinutes); return "$n minute$(if ($n -ne 1) { 's' })"
+}
+
+function Show-Dialog {
+    param(
+        [string]$Title,
+        [string]$Message,
+        [string[]]$Buttons = @('OK'),
+        [ValidateSet('info', 'question', 'warn', 'error', 'shield', 'ok')][string]$Icon = 'info',
+        [string]$CheckBox,
+        [object[]]$Items,
+        [scriptblock]$ItemLabel = { param($i) "$i" }
+    )
+    $look = @{
+        info = @('E946', $Colors.Accent); question = @('E9CE', $Colors.Accent); warn = @('E7BA', $Colors.Warn)
+        error = @('EA39', $Colors.Bad); shield = @('EA18', $Colors.Accent); ok = @('E930', $Colors.Good)
+    }[$Icon]
+
+    $dlg = New-Xaml @"
+<Window Title="PC Maintenance" Width="500" SizeToContent="Height" WindowStartupLocation="CenterOwner" ResizeMode="NoResize"
+        ShowInTaskbar="False" Background="White" FontFamily="Segoe UI" FontSize="14" Foreground="#1B1B1F" UseLayoutRounding="True"
+        TextOptions.TextFormattingMode="Display">
+  <DockPanel>
+    <Border DockPanel.Dock="Bottom" Background="#F5F5F7" BorderBrush="#E1E1E6" BorderThickness="0,1,0,0" Padding="20,14">
+      <StackPanel Name="Btns" Orientation="Horizontal" HorizontalAlignment="Right"/>
+    </Border>
+    <Grid Margin="24,22,24,20">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="Auto"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+      <TextBlock FontFamily="Segoe MDL2 Assets" FontSize="28" Text="&#x$($look[0]);" Foreground="$($look[1])" Margin="0,2,16,0" VerticalAlignment="Top"/>
+      <StackPanel Grid.Column="1" Name="Body">
+        <TextBlock Text="$(Esc $Title)" FontSize="18" FontWeight="SemiBold" TextWrapping="Wrap"/>
+        <TextBlock Text="$(Esc $Message)" Margin="0,8,0,0" TextWrapping="Wrap" Foreground="#3B3B42"/>
+      </StackPanel>
+    </Grid>
+  </DockPanel>
+</Window>
+"@
+    $body = $dlg.FindName('Body')
+    $btns = $dlg.FindName('Btns')
+
+    $itemBoxes = @()
+    if ($Items) {
+        $panel = New-Object System.Windows.Controls.StackPanel
+        foreach ($it in $Items) {
+            $cb = New-Object System.Windows.Controls.CheckBox
+            $cb.Content = (& $ItemLabel $it); $cb.Tag = $it; $cb.IsChecked = $true; $cb.Margin = '0,6,0,0'
+            [void]$panel.Children.Add($cb); $itemBoxes += $cb
+        }
+        $sv = New-Object System.Windows.Controls.ScrollViewer
+        $sv.MaxHeight = 220; $sv.VerticalScrollBarVisibility = 'Auto'; $sv.Margin = '0,10,0,0'; $sv.Content = $panel
+        [void]$body.Children.Add($sv)
+    }
+    $chk = $null
+    if ($CheckBox) {
+        $chk = New-Object System.Windows.Controls.CheckBox
+        $chk.Content = $CheckBox; $chk.IsChecked = $true; $chk.Margin = '0,14,0,0'
+        [void]$body.Children.Add($chk)
+    }
+    for ($i = 0; $i -lt $Buttons.Count; $i++) {
+        $b = New-Object System.Windows.Controls.Button
+        $b.Content = $Buttons[$i]; $b.Tag = $Buttons[$i]; $b.MinWidth = 96; $b.Margin = '8,0,0,0'
+        if ($i -eq 0) { $b.Style = $App.Resources['Primary']; $b.IsDefault = $true }
+        if ($i -eq $Buttons.Count - 1 -and $Buttons.Count -gt 1) { $b.IsCancel = $true }
+        $b.Add_Click({ param($s, $e) $script:DlgResult = $s.Tag; [System.Windows.Window]::GetWindow($s).Close() })
+        [void]$btns.Children.Add($b)
+    }
+
+    if ($script:Window -and $script:Window.IsVisible) { $dlg.Owner = $script:Window } else { $dlg.WindowStartupLocation = 'CenterScreen' }
+    $script:DlgResult = $null
+    $script:DialogDepth++
+    try { [void]$dlg.ShowDialog() } finally { $script:DialogDepth-- }
+    $btn = if ($script:DlgResult) { $script:DlgResult } else { $Buttons[-1] }
+    [pscustomobject]@{
+        Button  = $btn
+        Checked = ($chk -and $chk.IsChecked)
+        Items   = @($itemBoxes | Where-Object { $_.IsChecked } | ForEach-Object { $_.Tag })
+    }
+}
+
+function Show-Error($err) {
+    $msg = if ($err -is [System.Management.Automation.ErrorRecord]) { $err.Exception.Message } else { "$err" }
+    [void](Show-Dialog -Title 'Something went wrong' -Message $msg -Icon error)
+}
+
+function Restart-AsAdmin {
+    if ($script:TaskBusy) { return }
+    try {
+        if ($env:MAINT_LAUNCHER -and (Test-Path -LiteralPath $env:MAINT_LAUNCHER)) {
+            Start-Process -FilePath $env:MAINT_LAUNCHER -ArgumentList '--elevated' -Verb RunAs
+        } else {
+            Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -ArgumentList @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden', '-File', "`"$SelfPath`"", '-NoUpdate')
+        }
+    } catch {
+        return   # the user said No to the Windows permission prompt
+    }
+    $script:Window.Close()
+}
+
+function Restart-App {
+    if ($script:TaskBusy) { return }
+    if ($env:MAINT_LAUNCHER -and (Test-Path -LiteralPath $env:MAINT_LAUNCHER)) {
+        Start-Process -FilePath $env:MAINT_LAUNCHER -ArgumentList '--no-update'
+    } else {
+        Start-Process powershell.exe -WindowStyle Hidden -ArgumentList @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-STA', '-WindowStyle', 'Hidden', '-File', "`"$SelfPath`"", '-NoUpdate')
+    }
+    $script:Window.Close()
+}
+
+function Confirm-RestartComputer {
+    $d = Show-Dialog -Title 'Restart your PC now?' -Message 'Save your work and close your apps first. Your PC will restart right away.' -Buttons 'Restart now', 'Cancel' -Icon warn
+    if ($d.Button -eq 'Restart now') { Restart-Computer -Force }
+}
+
+# Offers to relaunch as admin. Returns $true if the app is already admin.
+function Confirm-Admin([string]$What) {
+    if (Test-IsAdmin) { return $true }
+    $d = Show-Dialog -Title 'Administrator rights needed' -Message "$What needs administrator rights. The app will restart and Windows will ask for permission." -Buttons 'Run as administrator', 'Cancel' -Icon shield
+    if ($d.Button -eq 'Run as administrator') { Restart-AsAdmin }
+    return $false
+}
+
+#endregion
+
+#region ---------- Navigation ----------
+
+$Panels = 'PanelApps', 'PanelClean', 'PanelBattery', 'PanelSleep', 'PanelPower', 'PanelInfo', 'PanelTask'
+$script:BackTarget = 'Home'
+
+function Show-Page([string]$Panel, [string]$Title, [string]$Subtitle, [string]$Back = 'Home') {
+    if ($Panel -eq 'Home') {
+        $ui.PageSub.Visibility = 'Collapsed'
+        $ui.PageHome.Visibility = 'Visible'
+        Update-Home
+        return
+    }
+    $ui.PageHome.Visibility = 'Collapsed'
+    $ui.PageSub.Visibility = 'Visible'
+    foreach ($p in $Panels) { $ui[$p].Visibility = if ($p -eq $Panel) { 'Visible' } else { 'Collapsed' } }
+    $ui.TxtPageTitle.Text = $Title
+    $ui.TxtPageSub.Text = $Subtitle
+    $ui.TxtPageSub.Visibility = if ($Subtitle) { 'Visible' } else { 'Collapsed' }
+    $script:BackTarget = $Back
+}
+
+function Open-Target([string]$Target) {
+    switch ($Target) {
+        'Apps'  { Open-Apps }
+        'Clean' { Open-Clean }
+        default { Show-Page 'Home' }
+    }
+}
+
+#endregion
+
+#region ---------- Home ----------
+
+function Update-Home {
+    Start-Worker -Work { Get-SystemSnapshot } -OnDone {
+        param($r, $err)
+        if ($r) { $script:Snapshot = $r; Show-HomeStatus $r }
+    }
+}
+
+function Show-HomeStatus($s) {
+    $c = @($s.Disks | Where-Object { $_.Drive -eq $env:SystemDrive }) | Select-Object -First 1
+    if ($c -and $c.Size) {
+        $freePct = 100 * $c.Free / $c.Size
+        $ui.TxtDiskMain.Text = '{0} free' -f (Format-Bytes $c.Free)
+        $ui.TxtDiskSub.Text = 'of {0} on drive {1}' -f (Format-Bytes $c.Size), $c.Drive
+        $ui.DiskBar.Value = 100 - $freePct
+        $color = if ($freePct -lt 10) { $Colors.Bad } elseif ($freePct -lt 20) { $Colors.Warn } else { $Colors.Accent }
+        $ui.DiskBar.Foreground = Get-Brush $color
+        if ($freePct -lt 10) { $ui.TxtDiskSub.Text += '. Running low: try Free up space.' }
+    }
+
+    $b = $s.Battery
+    if ($b) {
+        $ui.TxtBatMain.Text = '{0}%' -f $b.Charge
+        $src = if ($b.OnAC) { 'Plugged in' } else { 'On battery' }
+        $ui.TxtBatSub.Text = if ($null -ne $b.Health) { '{0} - health {1}%' -f $src, $b.Health } else { $src }
+    } else {
+        $ui.TxtBatMain.Text = 'No battery'
+        $ui.TxtBatSub.Text = 'This PC runs on mains power.'
+    }
+
+    if ($s.RebootNeeded) {
+        $ui.TxtRebootMain.Text = 'Needed'
+        $ui.TxtRebootMain.Foreground = Get-Brush $Colors.Warn
+        $ui.TxtRebootSub.Text = 'A restart is needed to finish installing updates.'
+        $ui.BtnRestartHome.Visibility = 'Visible'
+    } else {
+        $ui.TxtRebootMain.Text = 'Not needed'
+        $ui.TxtRebootMain.Foreground = Get-Brush $Colors.Good
+        $ui.TxtRebootSub.Text = 'Everything installed is in use.'
+        $ui.BtnRestartHome.Visibility = 'Collapsed'
+    }
+
+    $ui.TxtUpMain.Text = Format-Duration $s.Uptime
+    $ui.TxtUpSub.Text = 'Since ' + $s.LastBoot.ToString('dddd d MMM, HH:mm', [Globalization.CultureInfo]'en-US')
+    if ($s.Uptime.TotalDays -ge 7) { $ui.TxtUpSub.Text += '. Restarting now and then keeps your PC fast.' }
+}
+
+#endregion
+
+#region ---------- Task page (progress for long jobs) ----------
+
+$StepLook = @{
+    pending = @([char]0xEA3A, $Colors.Faint, 'Waiting')
+    running = @([char]0xE895, $Colors.Accent, 'Working...')
+    ok      = @([char]0xE73E, $Colors.Good, 'Done')
+    warn    = @([char]0xE7BA, $Colors.Warn, '')
+    error   = @([char]0xE711, $Colors.Bad, 'Failed')
+    skip    = @([char]0xE738, $Colors.Faint, 'Skipped')
+}
+$script:StepRows = @{}
+$script:StepOrder = New-Object System.Collections.ArrayList
+
+function Open-TaskPage([string]$Title, [string]$Subtitle, [string]$Back = 'Home') {
+    $script:TaskBusy = $true
+    $script:StepRows = @{}
+    $script:StepOrder.Clear()
+    $ui.TaskSteps.Children.Clear()
+    $ui.TxtTaskLog.Clear()
+    $ui.TaskResult.Visibility = 'Collapsed'
+    $ui.TaskProgressCard.Visibility = 'Visible'
+    $ui.BtnTaskDone.Visibility = 'Collapsed'
+    $ui.BtnTaskRestart.Visibility = 'Collapsed'
+    $ui.TxtTaskHint.Visibility = 'Visible'
+    $ui.TxtTaskStatus.Text = 'Getting started...'
+    $ui.TaskBar.IsIndeterminate = $true
+    $ui.TxtTaskElapsed.Text = ''
+    $ui.BtnBack.IsEnabled = $false
+    $ui.BtnElevate.IsEnabled = $false
+    $script:TaskClock = [Diagnostics.Stopwatch]::StartNew()
+    Show-Page 'PanelTask' $Title $Subtitle $Back
+}
+
+function Add-TaskStep([string]$Key, [string]$Label) {
+    $row = New-Xaml @"
+<Border BorderBrush="#F0F0F3" BorderThickness="0,0,0,1" Padding="0,10">
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width="34"/><ColumnDefinition Width="Auto" MinWidth="200"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+    <TextBlock FontFamily="Segoe MDL2 Assets, Segoe UI Symbol" FontSize="16" VerticalAlignment="Center"/>
+    <TextBlock Grid.Column="1" Text="$(Esc $Label)" FontWeight="SemiBold" VerticalAlignment="Center"/>
+    <TextBlock Grid.Column="2" Margin="16,0,0,0" TextWrapping="Wrap" VerticalAlignment="Center" TextAlignment="Right"/>
+  </Grid>
+</Border>
+"@
+    [void]$ui.TaskSteps.Children.Add($row)
+    $g = $row.Child
+    $script:StepRows[$Key] = [pscustomobject]@{ Icon = $g.Children[0]; Label = $Label; Detail = $g.Children[2]; State = 'pending'; Text = '' }
+    [void]$script:StepOrder.Add($Key)
+    Set-StepState $Key 'pending'
+}
+
+function Set-StepState([string]$Key, [string]$State, [string]$Detail = '') {
+    $r = $script:StepRows[$Key]
+    if (-not $r) { return }
+    $look = $StepLook[$State]
+    if (-not $look) { return }
+    $r.State = $State
+    $r.Text = if ($Detail) { $Detail } else { $look[2] }
+    $r.Icon.Text = [string]$look[0]
+    $r.Icon.Foreground = Get-Brush $look[1]
+    $r.Detail.Text = $r.Text
+    $r.Detail.Foreground = if ($State -in 'warn', 'error') { Get-Brush $look[1] } else { Get-Brush $Colors.Muted }
+}
+
+function Add-TaskLog([string]$Text) {
+    $box = $ui.TxtTaskLog
+    if ($box.Text.Length -gt 400000) { $box.Text = $box.Text.Substring(200000) }
+    $box.AppendText($Text + "`r`n")
+    $box.ScrollToEnd()
+}
+
+function Receive-TaskMessage($m) {
+    if ($m.Type -eq 'step') { Set-StepState $m.Key $m.State $m.Detail; return }
+    $prefix = switch ($m.Kind) { 'detail' { '    ' } 'warn' { '[!] ' } 'error' { '[X] ' } default { '' } }
+    Add-TaskLog ($prefix + $m.Text)
+}
+
+function Update-TaskProgress($w) {
+    if ($w.Sync.Status) { $ui.TxtTaskStatus.Text = $w.Sync.Status }
+    $p = [double]$w.Sync.Percent
+    if ($p -lt 0) { $ui.TaskBar.IsIndeterminate = $true }
+    else { $ui.TaskBar.IsIndeterminate = $false; $ui.TaskBar.Value = $p }
+}
+
+function Start-TaskWork {
+    param([scriptblock]$Work, [object[]]$ArgumentList = @(), [scriptblock]$OnDone)
+    $ui.TaskBar.IsIndeterminate = $true
+    Start-Worker -Foreground -Work $Work -ArgumentList $ArgumentList -OnDone $OnDone
+}
+
+# A "flow" is a list of stages run one after another; a stage that starts background work
+# calls Invoke-NextStage from its OnDone.
+function Start-Flow([scriptblock[]]$Stages) {
+    $script:Flow = New-Object System.Collections.Generic.List[scriptblock]
+    foreach ($s in $Stages) { $script:Flow.Add($s) }
+    Invoke-NextStage
+}
+function Invoke-NextStage {
+    if (-not $script:Flow -or $script:Flow.Count -eq 0) { return }
+    $s = $script:Flow[0]
+    $script:Flow.RemoveAt(0)
+    try { & $s } catch { Add-TaskLog "[X] $($_.Exception.Message)"; $script:Flow.Clear(); Complete-Task }
+}
+
+# Final banner, worked out from the step rows. $script:Ctx.Summary adds a sentence.
+function Complete-Task {
+    param([string]$ForceTitle, [string]$ForceMessage, [string]$ForceState)
+    $script:TaskBusy = $false
+    if ($script:TaskClock) { $script:TaskClock.Stop() }
+
+    $rows   = @($script:StepOrder | ForEach-Object { $script:StepRows[$_] })
+    $errors = @($rows | Where-Object { $_.State -eq 'error' })
+    $warns  = @($rows | Where-Object { $_.State -eq 'warn' })
+
+    if ($ForceState) { $state = $ForceState; $title = $ForceTitle; $msg = $ForceMessage }
+    elseif ($errors.Count) {
+        $state = 'error'; $title = 'Finished, but some things did not work'
+        $msg = ((@($errors) + @($warns) | ForEach-Object { '{0}: {1}' -f $_.Label, $_.Text }) -join "`n")
+    } elseif ($warns.Count) {
+        $state = 'warn'; $title = 'Finished, with a few notes'
+        $msg = (($warns | ForEach-Object { '{0}: {1}' -f $_.Label, $_.Text }) -join "`n")
+    } else {
+        $state = 'ok'; $title = 'All done'; $msg = 'Everything finished successfully.'
+    }
+    if ($script:Ctx -and $script:Ctx.Summary) { $msg = ($script:Ctx.Summary + "`n" + $msg).Trim() }
+
+    $look = @{
+        ok    = @('E930', '#DFF6DD', '#9FD89F', $Colors.Good)
+        warn  = @('E7BA', '#FFF4CE', '#F2D58A', $Colors.Warn)
+        error = @('EA39', '#FDE7E9', '#F1BBBC', $Colors.Bad)
+    }[$state]
+    $ui.TaskResultIcon.Text = [string][char][Convert]::ToInt32($look[0], 16)
+    $ui.TaskResultIcon.Foreground = Get-Brush $look[3]
+    $ui.TaskResult.Background = Get-Brush $look[1]
+    $ui.TaskResult.BorderBrush = Get-Brush $look[2]
+    $ui.TxtResultTitle.Text = $title
+
+    $reboot = $false
+    try { $reboot = Test-RebootNeeded } catch {}
+    if ($reboot) { $msg += "`nRestart your PC to finish installing updates." }
+    $ui.TxtResultMsg.Text = $msg
+    $ui.BtnTaskRestart.Visibility = if ($reboot) { 'Visible' } else { 'Collapsed' }
+
+    $ui.TaskResult.Visibility = 'Visible'
+    $ui.TaskProgressCard.Visibility = 'Collapsed'
+    $ui.BtnTaskDone.Visibility = 'Visible'
+    $ui.TxtTaskHint.Visibility = 'Collapsed'
+    $ui.BtnBack.IsEnabled = $true
+    $ui.BtnElevate.IsEnabled = $true
+    $ui.TaskBar.IsIndeterminate = $false
+    Add-TaskLog ('--- Finished after {0:hh\:mm\:ss} ---' -f $script:TaskClock.Elapsed)
+}
+
+#--- Shared stages ---
+
+function Invoke-RestoreStage {
+    Set-StepState 'restore' 'running' 'Creating...'
+    Start-TaskWork -Work { SetStatus 'Creating a safety restore point (usually under a minute)'; New-RestorePointCore 'PC Maintenance' } -OnDone {
+        param($r, $err)
+        if ($err) { $r = [pscustomobject]@{ Result = 'Failed'; Detail = $err } }
+        if ($r.Result -in 'Created', 'Recent') {
+            Set-StepState 'restore' 'ok' $r.Detail
+            Invoke-NextStage
+            return
+        }
+        Add-TaskLog "[!] Restore point: $($r.Detail)"
+        if (-not $script:Ctx.RestoreRetried) {
+            $d = Show-Dialog -Title "Couldn't create a restore point" -Icon warn `
+                -Message 'A restore point lets you undo system changes if an update causes problems. System Protection may be turned off on this PC.' `
+                -Buttons 'Turn it on and try again', 'Continue without', 'Stop'
+        } else {
+            $d = Show-Dialog -Title 'Still no restore point' -Icon warn `
+                -Message 'Windows still could not create a restore point. You can continue without one or stop here.' `
+                -Buttons 'Continue without', 'Stop'
+        }
+        switch ($d.Button) {
+            'Turn it on and try again' {
+                $script:Ctx.RestoreRetried = $true
+                Start-TaskWork -Work { SetStatus 'Turning on System Protection'; Enable-SystemProtectionCore } -OnDone {
+                    param($r2, $err2)
+                    if ($err2) { Add-TaskLog "[!] $err2" }
+                    Invoke-RestoreStage
+                }
+            }
+            'Continue without' { Set-StepState 'restore' 'skip' 'Not created'; Invoke-NextStage }
+            default {
+                Set-StepState 'restore' 'skip' 'Not created'
+                $script:Flow.Clear()
+                Complete-Task -ForceState 'warn' -ForceTitle 'Stopped' -ForceMessage 'Nothing was changed.'
+            }
+        }
+    }
+}
+
+function Invoke-ReinstallOfferStage {
+    $failed = @($script:Ctx.Failed)
+    if (-not $failed.Count) { Invoke-NextStage; return }
+    $d = Show-Dialog -Title "Some apps couldn't be updated" -Icon warn `
+        -Message 'Reinstalling usually fixes this: the app is removed and the newest version is installed fresh. Settings are normally kept, but close these apps first.' `
+        -Items $failed -ItemLabel { param($p) '{0}  ({1} to {2})' -f $p.Name, $p.Version, $p.Available } `
+        -Buttons 'Reinstall selected', 'Skip'
+    if ($d.Button -ne 'Reinstall selected' -or -not $d.Items.Count) { Invoke-NextStage; return }
+    foreach ($p in $d.Items) { Add-TaskStep ('re:' + $p.Id) ('Reinstall ' + $p.Name) }
+    Start-TaskWork -ArgumentList (, @($d.Items)) -Work { param($pkgs) Invoke-WingetReinstallSet -Packages $pkgs } -OnDone {
+        param($r, $err)
+        if ($err) { Add-TaskLog "[X] $err" }
+        Invoke-NextStage
+    }
+}
+
+#endregion
+
+#region ---------- Update everything ----------
+
+function Start-UpdateEverything {
+    $admin = Test-IsAdmin
+    if (-not $admin) {
+        $d = Show-Dialog -Title 'Run as administrator for a full update?' -Icon shield `
+            -Message "Windows Update, drivers, Microsoft Store apps, virus protection and the safety restore point need administrator rights.`n`nWithout them, only your apps, Office, WSL and PowerShell modules are updated." `
+            -Buttons 'Run as administrator', 'Continue anyway', 'Cancel'
+        if ($d.Button -eq 'Run as administrator') { Restart-AsAdmin; return }
+        if ($d.Button -ne 'Continue anyway') { return }
+    } else {
+        $d = Show-Dialog -Title 'Update everything?' -Icon question `
+            -Message "This updates your apps, Windows (including drivers), Microsoft Store apps, Office and virus protection. A restore point is created first so system changes can be undone.`n`nSome apps may close while they update, so save your work first. This can take a while, but you can keep using your PC." `
+            -Buttons 'Start', 'Cancel'
+        if ($d.Button -ne 'Start') { return }
+    }
+
+    $script:Ctx = @{ Failed = @(); Retired = @() }
+    Open-TaskPage 'Updating everything' 'This can take 10 to 60 minutes. You can keep using your PC in the meantime.'
+    Add-TaskStep 'restore' 'Safety restore point'
+    foreach ($s in $UpdateSteps) { Add-TaskStep $s.Key $s.Label }
+
+    $stages = @()
+    if ($admin) { $stages += { Invoke-RestoreStage } } else { Set-StepState 'restore' 'skip' 'Needs administrator' }
+    $stages += { Invoke-UpdateAllStage }, { Invoke-ReinstallOfferStage }, { Invoke-RetiredModulesStage }, { Complete-Task }
+    Start-Flow $stages
+}
+
+function Invoke-UpdateAllStage {
+    Start-TaskWork -Work {
+        $admin = Test-IsAdmin
+        $out = @{ Failed = @(); Retired = @() }
+        $n = $UpdateSteps.Count
+        for ($i = 0; $i -lt $n; $i++) {
+            $s = $UpdateSteps[$i]
+            $Sync.Base = 100 * $i / $n; $Sync.Span = 100 / $n
+            SetStatus $s.Label
+            if ($s.Admin -and -not $admin) { Step $s.Key 'skip' 'Needs administrator'; continue }
+            Step $s.Key 'running'
+            Log "--- $($s.Label) ---"
+            $ctx = @{ State = 'ok'; Text = 'Done'; Out = $out }
+            try {
+                & $s.Fn $ctx
+                Step $s.Key $ctx.State $ctx.Text
+            } catch {
+                Step $s.Key 'error' $_.Exception.Message
+                Log $_.Exception.Message 'error'
+            }
+        }
+        $Sync.Base = 0; $Sync.Span = 100
+        SetStatus 'Finishing up' 100
+        [pscustomobject]@{ Failed = @($out.Failed); Retired = @($out.Retired) }
+    } -OnDone {
+        param($r, $err)
+        if ($err) { Add-TaskLog "[X] $err" }
+        if ($r) { $script:Ctx.Failed = @($r.Failed); $script:Ctx.Retired = @($r.Retired) }
+        Invoke-NextStage
+    }
+}
+
+function Invoke-RetiredModulesStage {
+    $ret = @($script:Ctx.Retired | Where-Object { $_ })
+    if (-not $ret.Count) { Invoke-NextStage; return }
+    $d = Show-Dialog -Title 'Remove old Azure PowerShell modules?' -Icon question `
+        -Message ('{0} retired Azure PowerShell module(s) were found (AzureRM / Azure). They no longer get updates and conflict with the newer Az modules.' -f $ret.Count) `
+        -Buttons 'Remove them', 'Keep them'
+    if ($d.Button -ne 'Remove them') { Invoke-NextStage; return }
+    Add-TaskStep 'retired' 'Remove retired Azure modules'
+    Start-TaskWork -ArgumentList (, $ret) -Work {
+        param($names)
+        Step 'retired' 'running'
+        $left = @(Remove-RetiredModules $names)
+        if ($left.Count) { Step 'retired' 'warn' ('Could not remove {0}. Close other PowerShell windows and try again.' -f ($left -join ', ')) }
+        else { Step 'retired' 'ok' ('{0} removed' -f $names.Count) }
+    } -OnDone { param($r, $err) if ($err) { Add-TaskLog "[X] $err" }; Invoke-NextStage }
+}
+
+#endregion
+
+#region ---------- App updates ----------
+
+$script:AppRows = @()
+
+function Open-Apps {
+    Show-Page 'PanelApps' 'App updates' 'Pick the apps you want to update. Apps that are open may close for a moment while they update.'
+    Update-AppList
+}
+
+function Update-AppList {
+    $ui.AppsLoading.Visibility = 'Visible'
+    $ui.AppsEmpty.Visibility = 'Collapsed'
+    $ui.AppsCard.Visibility = 'Collapsed'
+    $ui.BtnAppsUpdate.IsEnabled = $false
+    $ui.BtnAppsSelect.IsEnabled = $false
+    $ui.BtnAppsRefresh.IsEnabled = $false
+    $inc = [bool]$ui.ChkAppsUnknown.IsChecked
+    Start-Worker -ArgumentList $inc -Work {
+        param($inc)
+        [pscustomobject]@{ List = @(Get-WingetUpgrades -IncludeUnknown:$inc) }
+    } -OnDone { param($r, $err) Show-AppList $r $err }
+}
+
+function Show-AppList($r, $err) {
+    $ui.AppsLoading.Visibility = 'Collapsed'
+    $ui.BtnAppsRefresh.IsEnabled = $true
+    $ui.AppsList.Children.Clear()
+    $script:AppRows = @()
+
+    if ($err -or -not $r -or -not @($r.List).Count) {
+        $ui.AppsEmpty.Visibility = 'Visible'
+        if ($err) {
+            $ui.AppsEmptyIcon.Text = [string][char]0xE7BA; $ui.AppsEmptyIcon.Foreground = Get-Brush $Colors.Warn
+            $ui.AppsEmptyTitle.Text = "Couldn't check for app updates"
+            $ui.AppsEmptyText.Text = $err
+        } else {
+            $ui.AppsEmptyIcon.Text = [string][char]0xE930; $ui.AppsEmptyIcon.Foreground = Get-Brush $Colors.Good
+            $ui.AppsEmptyTitle.Text = 'All your apps are up to date'
+            $ui.AppsEmptyText.Text = 'Nothing to do here. Check again another day.'
+        }
+        return
+    }
+
+    foreach ($p in @($r.List)) {
+        $row = New-Xaml @"
+<Border BorderBrush="#F0F0F3" BorderThickness="0,0,0,1" Padding="18,10">
+  <CheckBox IsChecked="True" HorizontalContentAlignment="Stretch" VerticalContentAlignment="Center" Cursor="Hand">
+    <Grid Margin="8,0,0,0">
+      <Grid.ColumnDefinitions><ColumnDefinition Width="*"/><ColumnDefinition Width="170"/><ColumnDefinition Width="162"/></Grid.ColumnDefinitions>
+      <StackPanel>
+        <TextBlock Text="$(Esc $p.Name)" FontWeight="SemiBold" TextTrimming="CharacterEllipsis"/>
+        <TextBlock Text="$(Esc $p.Id)" Foreground="#8A8A94" FontSize="12" TextTrimming="CharacterEllipsis"/>
+      </StackPanel>
+      <TextBlock Grid.Column="1" Text="$(Esc $p.Version)" Foreground="#5F5F6B" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+      <TextBlock Grid.Column="2" Text="$(Esc $p.Available)" Foreground="#107C10" FontWeight="SemiBold" VerticalAlignment="Center" TextTrimming="CharacterEllipsis"/>
+    </Grid>
+  </CheckBox>
+</Border>
+"@
+        $cb = $row.Child
+        $cb.Tag = $p
+        $cb.Add_Checked({ Update-AppsButtons })
+        $cb.Add_Unchecked({ Update-AppsButtons })
+        [void]$ui.AppsList.Children.Add($row)
+        $script:AppRows += $cb
+    }
+    $ui.AppsCard.Visibility = 'Visible'
+    $ui.BtnAppsSelect.IsEnabled = $true
+    Update-AppsButtons
+}
+
+function Update-AppsButtons {
+    $n = @($script:AppRows | Where-Object { $_.IsChecked }).Count
+    $ui.BtnAppsUpdate.IsEnabled = ($n -gt 0)
+    $ui.BtnAppsUpdate.Content = if ($n -eq 1) { 'Update 1 app' } else { "Update $n apps" }
+    $ui.BtnAppsSelect.Content = if ($n -eq $script:AppRows.Count) { 'Select none' } else { 'Select all' }
+}
+
+function Start-AppUpdates {
+    $pkgs = @($script:AppRows | Where-Object { $_.IsChecked } | ForEach-Object { $_.Tag })
+    if (-not $pkgs.Count) { return }
+    $admin = Test-IsAdmin
+    $what = if ($pkgs.Count -eq 1) { $pkgs[0].Name } else { "$($pkgs.Count) apps" }
+    $msg = 'Apps that are open may close for a moment while they update, so save your work first.'
+    if ($admin) {
+        $d = Show-Dialog -Title "Update $what?" -Message $msg -Buttons 'Update', 'Cancel' -Icon question -CheckBox 'Create a restore point first (recommended)'
+    } else {
+        $d = Show-Dialog -Title "Update $what?" -Message $msg -Buttons 'Update', 'Cancel' -Icon question
+    }
+    if ($d.Button -ne 'Update') { return }
+
+    $script:Ctx = @{ Pkgs = $pkgs; IncludeUnknown = [bool]$ui.ChkAppsUnknown.IsChecked; Failed = @() }
+    Open-TaskPage 'Updating apps' 'Apps may close for a moment while they update.' 'Apps'
+    $stages = @()
+    if ($admin -and $d.Checked) { Add-TaskStep 'restore' 'Safety restore point'; $stages += { Invoke-RestoreStage } }
+    foreach ($p in $pkgs) { Add-TaskStep $p.Id $p.Name }
+    $stages += { Invoke-AppUpgradeStage }, { Invoke-ReinstallOfferStage }, { Complete-Task }
+    Start-Flow $stages
+}
+
+function Invoke-AppUpgradeStage {
+    Start-TaskWork -ArgumentList (@(, @($script:Ctx.Pkgs)) + @($script:Ctx.IncludeUnknown)) -Work {
+        param($pkgs, $inc)
+        [pscustomobject]@{ Failed = @(Invoke-WingetUpgradeSet -Packages $pkgs -IncludeUnknown:$inc) }
+    } -OnDone {
+        param($r, $err)
+        if ($err) { Add-TaskLog "[X] $err"; foreach ($p in $script:Ctx.Pkgs) { if ($script:StepRows[$p.Id].State -ne 'ok') { Set-StepState $p.Id 'error' $err } } }
+        if ($r) { $script:Ctx.Failed = @($r.Failed) }
+        Invoke-NextStage
+    }
+}
+
+#endregion
+
+#region ---------- Free up space ----------
+
+function Open-Clean {
+    Show-Page 'PanelClean' 'Free up space' 'Choose what to remove. Your own documents, photos and other personal files are never touched.'
+    $admin = Test-IsAdmin
+    $ui.TxtCleanAdminNote.Visibility = if ($admin) { 'Collapsed' } else { 'Visible' }
+    foreach ($it in $CleanItems) {
+        $chk = $ui["ChkClean_$($it.Key)"]
+        $size = $ui["TxtCleanSize_$($it.Key)"]
+        if ($it.Admin -and -not $admin) {
+            $chk.IsEnabled = $false; $chk.IsChecked = $false
+            $size.Text = 'Needs administrator'; $size.Foreground = Get-Brush $Colors.Faint; $size.FontWeight = 'Normal'
+        } else {
+            $chk.IsEnabled = $true; $chk.IsChecked = $it.Default
+            $size.Text = 'Measuring...'; $size.Foreground = Get-Brush $Colors.Faint; $size.FontWeight = 'Normal'
+        }
+    }
+    Update-CleanDrive
+    $ui.BtnCleanRun.IsEnabled = $true
+
+    # One small job per item, so quick ones (Recycle Bin) don't wait for big folders
+    foreach ($it in $CleanItems) {
+        if ($it.Admin -and -not $admin) { continue }
+        if ($it.Key -eq 'dism') { Set-CleanSize 'dism' -2; continue }
+        Start-Worker -ArgumentList $it.Key -Work {
+            param($key)
+            $v = switch ($key) {
+                'usertemp' { Get-FolderSize $env:TEMP }
+                'wintemp'  { Get-FolderSize (Join-Path $env:windir 'Temp') }
+                'recycle'  { Get-RecycleBinSize }
+                'delivery' { Get-FolderSize $DeliveryCachePath }
+            }
+            [pscustomobject]@{ Key = $key; Size = $v }
+        } -OnDone {
+            param($r, $err)
+            if ($r) { Set-CleanSize $r.Key $r.Size }
+        }
+    }
+}
+
+# -1 = unknown, -2 = varies
+function Set-CleanSize([string]$Key, [double]$Bytes) {
+    $size = $ui["TxtCleanSize_$Key"]
+    if (-not $ui["ChkClean_$Key"].IsEnabled) { return }
+    if ($Bytes -eq -2) { $size.Text = 'Varies' }
+    elseif ($Bytes -lt 0) { $size.Text = '' }
+    elseif ($Bytes -eq 0) { $size.Text = 'Empty' }
+    else { $size.Text = Format-Bytes $Bytes; $size.Foreground = Get-Brush '#1B1B1F'; $size.FontWeight = 'SemiBold' }
+}
+
+function Update-CleanDrive {
+    $free = Get-SystemDriveFree; $size = Get-SystemDriveSize
+    $ui.TxtCleanDrive.Text = "Drive $env:SystemDrive"
+    $ui.TxtCleanFree.Text = '{0} free of {1}' -f (Format-Bytes $free), (Format-Bytes $size)
+    $freePct = 100 * $free / $size
+    $ui.CleanBar.Value = 100 - $freePct
+    $ui.CleanBar.Foreground = Get-Brush $(if ($freePct -lt 10) { $Colors.Bad } elseif ($freePct -lt 20) { $Colors.Warn } else { $Colors.Accent })
+}
+
+function Start-Cleanup {
+    $sel = @($CleanItems | Where-Object { $ui["ChkClean_$($_.Key)"].IsChecked })
+    if (-not $sel.Count) { [void](Show-Dialog -Title 'Nothing selected' -Message 'Tick at least one item to clean up.'); return }
+    if ($sel.Key -contains 'recycle') {
+        $d = Show-Dialog -Title 'Empty the Recycle Bin?' -Icon warn -Message "Files in the Recycle Bin will be deleted for good and can't be recovered afterwards." -Buttons 'Clean up', 'Cancel'
+        if ($d.Button -ne 'Clean up') { return }
+    }
+    $script:Ctx = @{ CleanKeys = @($sel | ForEach-Object { $_.Key }) }
+    Open-TaskPage 'Freeing up space' '' 'Clean'
+    foreach ($it in $sel) { Add-TaskStep $it.Key $it.Label }
+    Start-Flow @({ Invoke-CleanStage }, { Complete-Task })
+}
+
+function Invoke-CleanStage {
+    Start-TaskWork -ArgumentList (, @($script:Ctx.CleanKeys)) -Work {
+        param($keys)
+        $start = Get-SystemDriveFree
+        $n = $keys.Count
+        for ($i = 0; $i -lt $n; $i++) {
+            $k = $keys[$i]
+            $Sync.Base = 100 * $i / $n; $Sync.Span = 100 / $n
+            Step $k 'running'
+            $f0 = Get-SystemDriveFree
+            try {
+                $freed = $null
+                switch ($k) {
+                    'usertemp' { SetStatus 'Removing temporary files'; $freed = Clear-FolderContents $env:TEMP }
+                    'wintemp'  { SetStatus 'Removing Windows temporary files'; $freed = Clear-FolderContents (Join-Path $env:windir 'Temp') }
+                    'recycle'  { SetStatus 'Emptying the Recycle Bin'; Clear-RecycleBinAll }
+                    'delivery' {
+                        SetStatus 'Clearing the update download cache'
+                        if (-not (Get-Command Delete-DeliveryOptimizationCache -ErrorAction SilentlyContinue)) { throw 'Not available on this PC' }
+                        Delete-DeliveryOptimizationCache -Force
+                    }
+                    'dism' {
+                        SetStatus 'Cleaning up old Windows components (this is slow)'
+                        $code = Invoke-Native Dism.exe @('/Online', '/Cleanup-Image', '/StartComponentCleanup')
+                        if ($code -ne 0) { throw "Windows component cleanup failed (code $code)" }
+                    }
+                }
+                if ($null -eq $freed) { $freed = [math]::Max(0, (Get-SystemDriveFree) - $f0) }
+                Step $k 'ok' ('Freed {0}' -f (Format-Bytes $freed))
+                Log ('{0}: freed {1}' -f $k, (Format-Bytes $freed))
+            } catch {
+                Step $k 'error' $_.Exception.Message
+                Log $_.Exception.Message 'error'
+            }
+        }
+        $Sync.Base = 0; $Sync.Span = 100
+        $end = Get-SystemDriveFree
+        [pscustomobject]@{ Freed = [math]::Max(0, $end - $start); Free = $end }
+    } -OnDone {
+        param($r, $err)
+        if ($err) { Add-TaskLog "[X] $err" }
+        if ($r) { $script:Ctx.Summary = 'Freed {0} in total. Drive {1} now has {2} free.' -f (Format-Bytes $r.Freed), $env:SystemDrive, (Format-Bytes $r.Free) }
+        Invoke-NextStage
+    }
+}
+
+#endregion
+
+#region ---------- Battery ----------
+
+function Open-Battery {
+    Show-Page 'PanelBattery' 'Battery health' 'How much charge your battery can still hold compared to when it was new.'
+    $ui.TxtBatLoading.Text = 'Reading battery information...'
+    $ui.TxtBatLoading.Visibility = 'Visible'
+    $ui.BatContent.Visibility = 'Collapsed'
+    Start-Worker -Work { [pscustomobject]@{ B = Get-BatteryInfo } } -OnDone { param($r, $err) Show-Battery $r.B $err }
+}
+
+function Show-Battery($b, $err) {
+    if ($err) { $ui.TxtBatLoading.Text = "Couldn't read battery information: $err"; return }
+    if (-not $b) { $ui.TxtBatLoading.Text = "This PC doesn't have a battery."; return }
+    $ui.TxtBatLoading.Visibility = 'Collapsed'
+    $ui.BatContent.Visibility = 'Visible'
+
+    $ui.TxtBatCharge.Text = '{0}%' -f $b.Charge
+    $ui.BatChargeBar.Value = $b.Charge
+    $ui.TxtBatSource.Text = if ($b.OnAC) { 'Plugged in' } else { 'Running on battery' }
+
+    if ($null -ne $b.Health) {
+        $h = [int]$b.Health
+        $ui.TxtBatHealth.Text = "$h%"
+        $ui.BatHealthBar.Value = $h
+        $ui.TxtBatCap.Text = 'Holds {0:N0} mWh today, compared to {1:N0} mWh when new.' -f $b.Full, $b.Design
+        if ($h -ge 80) { $v = @('ok', 'Good. Your battery is in good shape.') }
+        elseif ($h -ge 60) { $v = @('warn', "Fair. The battery has worn a bit, so it won't last as long as when it was new.") }
+        else { $v = @('bad', 'Worn. The battery holds much less than when new. Consider asking IT about a replacement.') }
+    } else {
+        $ui.TxtBatHealth.Text = '?'
+        $ui.BatHealthBar.Value = 0
+        $ui.TxtBatCap.Text = "This PC doesn't report battery health."
+        $v = @('info', "Health isn't available here. The detailed battery report below may have more information.")
+    }
+    $look = @{
+        ok   = @('E930', '#DFF6DD', '#9FD89F', $Colors.Good)
+        warn = @('E7BA', '#FFF4CE', '#F2D58A', $Colors.Warn)
+        bad  = @('EA39', '#FDE7E9', '#F1BBBC', $Colors.Bad)
+        info = @('E946', '#EBF3FC', '#B4D6FA', $Colors.Accent)
+    }[$v[0]]
+    $ui.BatHealthBar.Foreground = Get-Brush $look[3]
+    $ui.BatVerdict.Background = Get-Brush $look[1]
+    $ui.BatVerdict.BorderBrush = Get-Brush $look[2]
+    $ui.BatVerdictIcon.Text = [string][char][Convert]::ToInt32($look[0], 16)
+    $ui.BatVerdictIcon.Foreground = Get-Brush $look[3]
+    $ui.TxtBatVerdict.Text = $v[1]
+}
+
+function New-BatteryReport {
+    $ui.BtnBatReport.IsEnabled = $false
+    $path = Get-DesktopPath ('battery-report-{0:yyyyMMdd-HHmm}.html' -f (Get-Date))
+    Start-Worker -ArgumentList $path -Work {
+        param($path)
+        $ErrorActionPreference = 'Continue'
+        & powercfg /batteryreport /output $path 2>&1 | Out-Null
+        [pscustomobject]@{ Ok = (Test-Path $path); Path = $path }
+    } -OnDone {
+        param($r, $err)
+        $ui.BtnBatReport.IsEnabled = $true
+        if ($r -and $r.Ok) { Invoke-Item $r.Path; [void](Show-Dialog -Title 'Battery report created' -Icon ok -Message "The report opened in your browser. It's also saved on your desktop:`n$($r.Path)") }
+        else { Show-Error "Windows couldn't create the battery report. $err" }
+    }
+}
+
+#endregion
+
+#region ---------- Sleep and wake ----------
+
+function Open-Sleep {
+    Show-Page 'PanelSleep' 'Sleep and wake' 'Find out what wakes your PC up and what stops it from going to sleep.'
+    Update-Sleep
+}
+
+function Update-Sleep {
+    $ui.TxtSleepLoading.Visibility = 'Visible'
+    $ui.SleepContent.Visibility = 'Collapsed'
+    Start-Worker -ArgumentList (Test-IsAdmin) -Work {
+        param($admin)
+        [pscustomobject]@{
+            Admin    = $admin
+            LastWake = Get-NativeText powercfg @('/lastwake')
+            Devices  = @(Get-WakeArmedDevices)
+            Timers   = if ($admin) { Get-NativeText powercfg @('/waketimers') } else { '' }
+            Requests = if ($admin) { Get-NativeText powercfg @('/requests') } else { '' }
+        }
+    } -OnDone { param($r, $err) Show-Sleep $r $err }
+}
+
+function Show-Sleep($r, $err) {
+    if ($err) { $ui.TxtSleepLoading.Text = "Couldn't read sleep information: $err"; return }
+    $ui.TxtSleepLoading.Visibility = 'Collapsed'
+    $ui.SleepContent.Visibility = 'Visible'
+    $ui.TxtLastWake.Text = $r.LastWake
+    $ui.WakeDevices.Children.Clear()
+    if (-not @($r.Devices).Count) {
+        [void]$ui.WakeDevices.Children.Add((New-Xaml '<TextBlock Text="No devices are allowed to wake this PC." Foreground="#5F5F6B"/>'))
+    }
+    foreach ($dev in @($r.Devices)) {
+        $row = New-Xaml @"
+<Border BorderBrush="#F0F0F3" BorderThickness="0,1,0,0" Padding="0,8">
+  <DockPanel>
+    <Button DockPanel.Dock="Right" Content="Stop it waking the PC" Padding="12,5"/>
+    <TextBlock Text="$(Esc $dev)" VerticalAlignment="Center" TextWrapping="Wrap" Margin="0,0,12,0"/>
+  </DockPanel>
+</Border>
+"@
+        $btn = $row.Child.Children[0]
+        $btn.Tag = $dev
+        $btn.Add_Click({ param($s, $e) Disable-WakeDevice $s.Tag })
+        [void]$ui.WakeDevices.Children.Add($row)
+    }
+    $ui.SleepAdmin.Visibility = if ($r.Admin) { 'Visible' } else { 'Collapsed' }
+    $ui.TxtSleepAdminNote.Visibility = if ($r.Admin) { 'Collapsed' } else { 'Visible' }
+    $ui.TxtWakeTimers.Text = $r.Timers
+    $ui.TxtRequests.Text = $r.Requests
+}
+
+function Disable-WakeDevice([string]$Name) {
+    if (-not (Confirm-Admin 'Changing which devices can wake the PC')) { return }
+    $d = Show-Dialog -Title 'Stop this device from waking the PC?' -Icon question `
+        -Message "$Name`n`nIt will still work normally, it just can't wake the PC from sleep anymore. You can turn it back on in Device Manager." `
+        -Buttons 'Stop it', 'Cancel'
+    if ($d.Button -ne 'Stop it') { return }
+    & powercfg /devicedisablewake "$Name"
+    if ($LASTEXITCODE -ne 0) { Show-Error "Windows couldn't change this device (powercfg error $LASTEXITCODE)." }
+    Update-Sleep
+}
+
+function New-SleepStudy {
+    if (-not (Confirm-Admin 'The sleep report')) { return }
+    $ui.BtnSleepStudy.IsEnabled = $false
+    $path = Get-DesktopPath ('sleep-report-{0:yyyyMMdd-HHmm}.html' -f (Get-Date))
+    Start-Worker -ArgumentList $path -Work {
+        param($path)
+        $ErrorActionPreference = 'Continue'
+        & powercfg /sleepstudy /output $path 2>&1 | Out-Null
+        [pscustomobject]@{ Ok = (Test-Path $path); Path = $path }
+    } -OnDone {
+        param($r, $err)
+        $ui.BtnSleepStudy.IsEnabled = $true
+        if ($r -and $r.Ok) { Invoke-Item $r.Path }
+        else { Show-Error "Windows couldn't create a sleep report. It's only available on PCs with Modern Standby (most newer laptops)." }
+    }
+}
+
+#endregion
+
+#region ---------- Lid and sign-in ----------
+
+function Open-Power {
+    Show-Page 'PanelPower' 'Lid and sign-in' 'Choose what happens when you close the lid, and whether you need a password after sleep.'
+    $ui.PowerSaved.Visibility = 'Collapsed'
+    $script:Lid = Get-PowerVal -Sub 'SUB_BUTTONS' -Setting 'LIDACTION'
+    if ($script:Lid.OK) {
+        $ui.CardLid.Visibility = 'Visible'; $ui.CardNoLid.Visibility = 'Collapsed'
+        $ui.CmbLidAC.SelectedIndex = [math]::Min(3, $script:Lid.AC)
+        $ui.CmbLidDC.SelectedIndex = [math]::Min(3, $script:Lid.DC)
+    } else {
+        $ui.CardLid.Visibility = 'Collapsed'; $ui.CardNoLid.Visibility = 'Visible'
+    }
+
+    $lock = Get-PowerVal -Sub 'SUB_NONE' -Setting 'CONSOLELOCK'
+    $require = if ($lock.OK) { [bool]$lock.AC } else { $true }
+    $note = ''
+    $reg = Get-ItemProperty 'HKCU:\Control Panel\Desktop' -Name DelayLockInterval -ErrorAction SilentlyContinue
+    if ($null -ne $reg) {
+        $v = [int]$reg.DelayLockInterval
+        if ($v -eq 0) { $require = $true } elseif ($v -eq -1) { $require = $false } else { $note = "Currently: after $v seconds away." }
+    }
+    $ui.CmbSignIn.SelectedIndex = if ($require) { 0 } else { 1 }
+    $ui.TxtSignInNote.Text = $note
+    $ui.TxtSignInNote.Visibility = if ($note) { 'Visible' } else { 'Collapsed' }
+}
+
+function Save-Power {
+    $ui.PowerSaved.Visibility = 'Collapsed'
+    if ($script:Lid.OK) {
+        $ac = $ui.CmbLidAC.SelectedIndex; $dc = $ui.CmbLidDC.SelectedIndex
+        if (($ac -eq 2 -or $dc -eq 2) -and -not (Test-HibernateEnabled)) {
+            $d = Show-Dialog -Title 'Hibernate is turned off' -Icon warn `
+                -Message "Hibernate is turned off on this PC, so choosing 'Hibernate' might not do anything. Save anyway?" -Buttons 'Save anyway', 'Cancel'
+            if ($d.Button -ne 'Save anyway') { return }
+        }
+        Set-PowerVal -Sub 'SUB_BUTTONS' -Setting 'LIDACTION' -Value $ac -AC
+        Set-PowerVal -Sub 'SUB_BUTTONS' -Setting 'LIDACTION' -Value $dc -DC
+    }
+    $require = ($ui.CmbSignIn.SelectedIndex -eq 0)
+    Set-PowerVal -Sub 'SUB_NONE' -Setting 'CONSOLELOCK' -Value ([int]$require) -AC -DC
+    # Modern Standby laptops use this instead (0 = every time, -1 = never)
+    Set-ItemProperty 'HKCU:\Control Panel\Desktop' -Name DelayLockInterval -Value ([int]$(if ($require) { 0 } else { -1 })) -Type DWord
+    $ui.TxtSignInNote.Visibility = 'Collapsed'
+    $ui.PowerSaved.Visibility = 'Visible'
+}
+
+#endregion
+
+#region ---------- About this PC ----------
+
+function Open-Info {
+    Show-Page 'PanelInfo' 'About this PC' 'The details IT support usually asks for.'
+    $ui.TxtInfoLoading.Visibility = 'Visible'
+    $ui.InfoCard.Visibility = 'Collapsed'
+    $ui.InfoDisksTitle.Visibility = 'Collapsed'
+    $ui.InfoDisks.Children.Clear()
+    $ui.TxtInfoCopy.Text = 'Copy details'
+    Start-Worker -Work { Get-SystemSnapshot } -OnDone { param($r, $err) Show-Info $r $err }
+}
+
+function Show-Info($s, $err) {
+    if ($err -or -not $s) { $ui.TxtInfoLoading.Text = "Couldn't read PC information: $err"; return }
+    $ui.TxtInfoLoading.Visibility = 'Collapsed'
+    $ui.InfoCard.Visibility = 'Visible'
+    $ui.InfoRows.Children.Clear()
+
+    $bat = if ($s.Battery) {
+        $t = '{0}% ({1})' -f $s.Battery.Charge, $(if ($s.Battery.OnAC) { 'plugged in' } else { 'on battery' })
+        if ($null -ne $s.Battery.Health) { $t += ', health {0}%' -f $s.Battery.Health }
+        $t
+    } else { 'None' }
+    $reasons = @($s.RebootReasons | Where-Object { $_ -notlike 'Pending file renames*' })
+    $rows = [ordered]@{
+        'Computer name'   = $s.Computer
+        'Signed in as'    = $s.User
+        'Model'           = $s.Model
+        'Serial number'   = $s.Serial
+        'Windows'         = $s.OS
+        'Windows build'   = $s.Build
+        'Processor'       = $s.Cpu
+        'Memory'          = '{0} ({1} free right now)' -f (Format-Bytes $s.MemTotal), (Format-Bytes $s.MemFree)
+        'Power plan'      = $s.PowerPlan
+        'Battery'         = $bat
+        'Last restart'    = '{0:yyyy-MM-dd HH:mm} ({1} ago)' -f $s.LastBoot, (Format-Duration $s.Uptime)
+        'Restart needed'  = if ($reasons.Count) { 'Yes: ' + ($reasons -join ', ') } else { 'No' }
+        'Administrator'   = if ($s.IsAdmin) { 'Yes' } else { 'No' }
+        'App version'     = "PC Maintenance $AppVersion"
+    }
+    $script:InfoText = ($rows.Keys | ForEach-Object { '{0,-16}: {1}' -f $_, $rows[$_] }) -join "`r`n"
+    $first = $true
+    foreach ($k in $rows.Keys) {
+        $border = if ($first) { '0' } else { '0,1,0,0' }
+        $first = $false
+        $row = New-Xaml @"
+<Border BorderBrush="#F0F0F3" BorderThickness="$border" Padding="0,9">
+  <Grid>
+    <Grid.ColumnDefinitions><ColumnDefinition Width="180"/><ColumnDefinition Width="*"/></Grid.ColumnDefinitions>
+    <TextBlock Text="$(Esc $k)" Foreground="#5F5F6B"/>
+    <TextBlock Grid.Column="1" Text="$(Esc $rows[$k])" TextWrapping="Wrap"/>
+  </Grid>
+</Border>
+"@
+        [void]$ui.InfoRows.Children.Add($row)
+    }
+
+    $diskLines = @()
+    foreach ($d in @($s.Disks)) {
+        if (-not $d.Size) { continue }
+        $freePct = 100 * $d.Free / $d.Size
+        $color = if ($freePct -lt 10) { $Colors.Bad } elseif ($freePct -lt 20) { $Colors.Warn } else { $Colors.Accent }
+        $name = if ($d.Label) { '{0} ({1})' -f $d.Drive, $d.Label } else { $d.Drive }
+        $line = '{0} free of {1}' -f (Format-Bytes $d.Free), (Format-Bytes $d.Size)
+        $diskLines += '{0,-16}: {1}' -f "Disk $($d.Drive)", $line
+        $card = New-Xaml @"
+<Border Background="White" BorderBrush="#E1E1E6" BorderThickness="1" CornerRadius="8" Padding="18,14" Margin="0,0,0,10">
+  <StackPanel>
+    <DockPanel>
+      <TextBlock DockPanel.Dock="Right" Text="$(Esc $line)" Foreground="#5F5F6B"/>
+      <TextBlock Text="$(Esc $name)" FontWeight="SemiBold"/>
+    </DockPanel>
+    <ProgressBar Height="8" Maximum="100" Value="$([int](100 - $freePct))" Foreground="$color" Margin="0,10,0,0"/>
+  </StackPanel>
+</Border>
+"@
+        [void]$ui.InfoDisks.Children.Add($card)
+    }
+    if ($diskLines.Count) {
+        $ui.InfoDisksTitle.Visibility = 'Visible'
+        $script:InfoText += "`r`n" + ($diskLines -join "`r`n")
+    }
+}
+
+#endregion
+
+#region ---------- Restore point ----------
+
+function Start-RestorePointTask {
+    if (-not (Confirm-Admin 'Creating a restore point')) { return }
+    $d = Show-Dialog -Title 'Create a restore point?' -Icon question `
+        -Message "A restore point is a snapshot of Windows settings and system files. If something goes wrong later, Windows can go back to it.`n`nYour personal files are not affected." `
+        -Buttons 'Create', 'Cancel'
+    if ($d.Button -ne 'Create') { return }
+    $script:Ctx = @{}
+    Open-TaskPage 'Creating a restore point' ''
+    Add-TaskStep 'restore' 'Restore point'
+    Start-Flow @({ Invoke-RestoreStage }, { Complete-Task })
+}
+
+#endregion
+
+#region ---------- Self-update (git pull) ----------
+
+function Start-SelfUpdateCheck {
+    if ($NoUpdate) { return }
+    Start-Worker -ArgumentList $AppDir, $RepoUrl -Work {
+        param($dir, $url)
+        $ErrorActionPreference = 'Continue'
+        if (-not (Get-Command git -ErrorAction SilentlyContinue) -or -not (Test-Path (Join-Path $dir '.git'))) {
+            return [pscustomobject]@{ Status = 'skip' }
+        }
+        $env:GIT_TERMINAL_PROMPT = '0'
+        $old = "$(& git -C $dir -c safe.directory=* rev-parse --short HEAD 2>$null)".Trim()
+        $null = & git -C $dir -c safe.directory=* pull --ff-only --quiet $url main 2>&1
+        $ok = ($LASTEXITCODE -eq 0)
+        $new = "$(& git -C $dir -c safe.directory=* rev-parse --short HEAD 2>$null)".Trim()
+        $log = @()
+        if ($ok -and $old -and $new -and $old -ne $new) { $log = @(& git -C $dir -c safe.directory=* log --format=%s "$old..$new" 2>$null) }
+        $status = if (-not $ok) { 'failed' } elseif ($old -ne $new) { 'updated' } else { 'current' }
+        [pscustomobject]@{ Status = $status; Old = $old; New = $new; Log = $log }
+    } -OnDone {
+        param($r, $err)
+        if (-not $r -or $r.Status -ne 'updated') { return }
+        $n = @($r.Log).Count
+        $ui.TxtBanner.Text = 'A newer version of PC Maintenance was downloaded ({0} change{1}). Restart the app to start using it.' -f $n, $(if ($n -ne 1) { 's' })
+        $ui.Banner.ToolTip = (@($r.Log) -join "`n")
+        $ui.Banner.Visibility = 'Visible'
+    }
+}
+
+#endregion
+
+#region ---------- Start ----------
+
+try {
+    $App = New-Object System.Windows.Application
+    $App.ShutdownMode = 'OnMainWindowClose'
+    $App.Resources = [Windows.Markup.XamlReader]::Parse($ResourcesXaml)
+    $App.Add_DispatcherUnhandledException({
+        param($s, $e)
+        $e.Handled = $true
+        try { Show-Error $e.Exception.Message } catch {}
+    })
+
+    $script:Window = [Windows.Markup.XamlReader]::Parse($MainXaml)
+    $ui = @{}
+    foreach ($m in [regex]::Matches($MainXaml, 'x:Name="(\w+)"')) { $ui[$m.Groups[1].Value] = $script:Window.FindName($m.Groups[1].Value) }
+
+    $iconPath = Join-Path $AppDir 'assets\app.ico'
+    if (Test-Path $iconPath) { try { $script:Window.Icon = [Windows.Media.Imaging.BitmapFrame]::Create([Uri]$iconPath) } catch {} }
+
+    $isAdmin = Test-IsAdmin
+    $ui.TxtVersion.Text = "Version $AppVersion"
+    $script:Window.Title = if ($isAdmin) { "PC Maintenance $AppVersion (Administrator)" } else { "PC Maintenance $AppVersion" }
+    $ui.AdminBadge.Visibility = if ($isAdmin) { 'Visible' } else { 'Collapsed' }
+    $ui.BtnElevate.Visibility = if ($isAdmin) { 'Collapsed' } else { 'Visible' }
+
+    # --- wire up events ---
+    $ui.BtnElevate.Add_Click({ Restart-AsAdmin })
+    $ui.BtnBanner.Add_Click({ Restart-App })
+    $ui.BtnBack.Add_Click({ Open-Target $script:BackTarget })
+    $ui.BtnUpdateAll.Add_Click({ Start-UpdateEverything })
+    $ui.BtnRestartHome.Add_Click({ Confirm-RestartComputer })
+
+    $ui.TileApps.Add_Click({ Open-Apps })
+    $ui.TileClean.Add_Click({ Open-Clean })
+    $ui.TileBattery.Add_Click({ Open-Battery })
+    $ui.TileSleep.Add_Click({ Open-Sleep })
+    $ui.TilePower.Add_Click({ Open-Power })
+    $ui.TileInfo.Add_Click({ Open-Info })
+    $ui.TileRestore.Add_Click({ Start-RestorePointTask })
+    $ui.TileWU.Add_Click({ Start-Process 'ms-settings:windowsupdate' })
+
+    $ui.BtnAppsUpdate.Add_Click({ Start-AppUpdates })
+    $ui.BtnAppsRefresh.Add_Click({ Update-AppList })
+    $ui.ChkAppsUnknown.Add_Click({ Update-AppList })
+    $ui.BtnAppsSelect.Add_Click({
+        $all = @($script:AppRows | Where-Object { $_.IsChecked }).Count -ne $script:AppRows.Count
+        foreach ($cb in $script:AppRows) { $cb.IsChecked = $all }
+    })
+
+    $ui.BtnCleanRun.Add_Click({ Start-Cleanup })
+    $ui.BtnCleanMgr.Add_Click({ Start-Process cleanmgr.exe -ArgumentList "/d $($env:SystemDrive.TrimEnd(':'))" })
+
+    $ui.BtnBatReport.Add_Click({ New-BatteryReport })
+    $ui.BtnSleepRefresh.Add_Click({ Update-Sleep })
+    $ui.BtnSleepStudy.Add_Click({ New-SleepStudy })
+    $ui.BtnPowerSave.Add_Click({ Save-Power })
+    $ui.CmbLidAC.Add_SelectionChanged({ $ui.PowerSaved.Visibility = 'Collapsed' })
+    $ui.CmbLidDC.Add_SelectionChanged({ $ui.PowerSaved.Visibility = 'Collapsed' })
+    $ui.CmbSignIn.Add_SelectionChanged({ $ui.PowerSaved.Visibility = 'Collapsed' })
+    $ui.BtnInfoCopy.Add_Click({
+        if ($script:InfoText) { [System.Windows.Clipboard]::SetText($script:InfoText); $ui.TxtInfoCopy.Text = 'Copied!' }
+    })
+
+    $ui.BtnTaskDone.Add_Click({ Open-Target $script:BackTarget })
+    $ui.BtnTaskRestart.Add_Click({ Confirm-RestartComputer })
+
+    $script:Window.Add_Closing({
+        param($s, $e)
+        if ($script:TaskBusy) {
+            $d = Show-Dialog -Title 'A task is still running' -Icon warn `
+                -Message 'If you close the app now, the current task is stopped and may be left half-finished. Close anyway?' `
+                -Buttons 'Keep it running', 'Close anyway'
+            if ($d.Button -ne 'Close anyway') { $e.Cancel = $true; return }
+        }
+        foreach ($w in @($script:Workers)) { try { [void]$w.PS.BeginStop($null, $null) } catch {} }
+    })
+
+    $timer = New-Object System.Windows.Threading.DispatcherTimer
+    $timer.Interval = [TimeSpan]::FromMilliseconds(150)
+    $timer.Add_Tick({ try { Invoke-WorkerTick } catch { try { Add-TaskLog "[X] $($_.Exception.Message)" } catch {} } })
+
+    $script:Window.Add_ContentRendered({
+        $timer.Start()
+        Update-Home
+        Start-SelfUpdateCheck
+        switch ($StartPage) {
+            'Apps'    { Open-Apps }
+            'Clean'   { Open-Clean }
+            'Battery' { Open-Battery }
+            'Sleep'   { Open-Sleep }
+            'Power'   { Open-Power }
+            'Info'    { Open-Info }
+        }
+    })
+
+    [void]$App.Run($script:Window)
+} catch {
+    $msg = $_ | Out-String
+    try { $msg | Set-Content -Encoding UTF8 (Join-Path $env:TEMP 'PCMaintenance-error.log') } catch {}
+    [void][System.Windows.MessageBox]::Show("PC Maintenance could not start.`n`n$($_.Exception.Message)", 'PC Maintenance', 'OK', 'Error')
+}
+# Background jobs (e.g. a stuck Windows Update search) must not keep the process alive.
+[Environment]::Exit(0)
+
+#endregion
