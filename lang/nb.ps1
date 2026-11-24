@@ -375,4 +375,18 @@ Add-Strings @{
     'Show details' = 'Vis detaljer'
     'Tip: let PC Maintenance keep this PC up to date by itself.' = 'Tips: la PC Maintenance holde PC-en oppdatert av seg selv.'
     'Set up' = 'Sett opp'
+
+    # --- Restore point setting ---
+    'A safety snapshot of Windows settings and system files, so system changes can be undone.' = 'Et sikkerhetsbilde av Windows-innstillinger og systemfiler, slik at systemendringer kan angres.'
+    'Create a restore point before updates' = 'Opprett et gjenopprettingspunkt før oppdateringer'
+    "Recommended on your own PC. Turn it off if restore points aren't allowed, which is common on work PCs. Then PC Maintenance never creates or asks about them." = 'Anbefalt på din egen PC. Slå det av hvis gjenopprettingspunkter ikke er tillatt, noe som er vanlig på jobb-PC-er. Da oppretter eller spør PC Maintenance aldri om dem.'
+    'Create one now' = 'Opprett et nå'
+    'Useful before you change settings or install something yourself. Needs administrator rights.' = 'Nyttig før du endrer innstillinger eller installerer noe selv. Krever administratorrettigheter.'
+    'Create a restore point' = 'Opprett gjenopprettingspunkt'
+    'Your organization has turned off restore points on this PC, so PC Maintenance never creates or asks about them.' = 'Organisasjonen din har slått av gjenopprettingspunkter på denne PC-en, så PC Maintenance oppretter eller spør aldri om dem.'
+    "Don't try to create restore points again (for example on a work PC where they aren't allowed)" = 'Ikke prøv å opprette gjenopprettingspunkter igjen (for eksempel på en jobb-PC der det ikke er tillatt)'
+    'Restore points are turned off. You can turn them back on under Restore point.' = 'Gjenopprettingspunkter er slått av. Du kan slå dem på igjen under Gjenopprettingspunkt.'
+    'Restore points before updates turned on' = 'Gjenopprettingspunkt før oppdateringer slått på'
+    'Restore points before updates turned off' = 'Gjenopprettingspunkt før oppdateringer slått av'
+    "This updates your apps, Windows (including drivers), Microsoft Store apps, Office and virus protection.`n`nSome apps may close while they update, so save your work first. This can take a while, but you can keep using your PC." = "Dette oppdaterer appene dine, Windows (med drivere), Microsoft Store-apper, Office og virusbeskyttelse.`n`nNoen apper kan lukkes mens de oppdateres, så lagre arbeidet ditt først. Det kan ta en stund, men du kan bruke PC-en imens."
 }

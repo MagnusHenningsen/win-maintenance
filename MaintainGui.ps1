@@ -1175,18 +1175,56 @@ $Sections = [ordered]@{
     info     = 'Information'
 }
 
+# Core Norwegian text first: page XAML below is translated when it is built
+$LangFile = Join-Path $AppDir 'lang\nb.ps1'
+if (Test-Path $LangFile) { . $LangFile }
+
 Register-Feature @{ Name = 'Sleep';   Section = 'fix';      Order = 50; Glyph = 'E708'; Title = 'Sleep and wake';  Desc = "Find out why your PC wakes up by itself or won't sleep."; Open = { Open-Sleep } }
 Register-Feature @{ Name = 'Battery'; Section = 'fix';      Order = 60; Glyph = 'E83F'; Title = 'Battery health';  Desc = (T 'Check how well your battery still holds a charge.'); Open = { Open-Battery } }
 Register-Feature @{ Name = 'Apps';    Section = 'tidy';     Order = 10; Glyph = 'E71D'; Title = 'App updates';     Desc = (T 'See which apps have updates and choose what to install.'); Open = { Open-Apps } }
 Register-Feature @{ Name = 'Clean';   Section = 'tidy';     Order = 20; Glyph = 'E74D'; Title = 'Free up space';   Desc = (T 'Remove temporary files and empty the Recycle Bin.'); Open = { Open-Clean } }
-Register-Feature @{ Name = 'Restore'; Section = 'settings'; Order = 20; Glyph = 'E777'; Title = 'Restore point';   Desc = (T 'Take a safety snapshot so system changes can be undone.'); Open = { Start-RestorePointTask } }
+Register-Feature @{
+    Name = 'Restore'; Section = 'settings'; Order = 20; Glyph = 'E777'; Title = 'Restore point'
+    Desc = 'Take a safety snapshot so system changes can be undone.'
+    Open = { Open-Restore }
+    Panel = 'PanelRestore'
+    Xaml = @"
+          <ScrollViewer x:Name="PanelRestore" Visibility="Collapsed" VerticalScrollBarVisibility="Auto">
+            <StackPanel Margin="24,8,24,24" MaxWidth="760" HorizontalAlignment="Left">
+              <Border x:Name="RestoreBlocked" Background="{DynamicResource InfoBg}" BorderBrush="{DynamicResource InfoLine}" BorderThickness="1"
+                      CornerRadius="8" Padding="16" Margin="0,0,0,12" Visibility="Collapsed">
+                <DockPanel>
+                  <TextBlock FontFamily="{StaticResource Icons}" Text="&#xE946;" FontSize="18" Foreground="{DynamicResource Accent}" Margin="0,0,12,0" VerticalAlignment="Top"/>
+                  <TextBlock TextWrapping="Wrap" Text="$(X 'Your organization has turned off restore points on this PC, so PC Maintenance never creates or asks about them.')"/>
+                </DockPanel>
+              </Border>
+              <Border Style="{StaticResource Card}" Margin="0,0,0,12">
+                <StackPanel>
+                  <CheckBox x:Name="ChkRestoreBefore" FontWeight="SemiBold" Content="$(X 'Create a restore point before updates')"/>
+                  <TextBlock Style="{StaticResource MutedText}" Margin="26,6,0,0"
+                             Text="$(X 'Recommended on your own PC. Turn it off if restore points aren''t allowed, which is common on work PCs. Then PC Maintenance never creates or asks about them.')"/>
+                </StackPanel>
+              </Border>
+              <Border Style="{StaticResource Card}">
+                <StackPanel>
+                  <TextBlock Text="$(X 'Create one now')" Style="{StaticResource CardTitle}"/>
+                  <TextBlock Style="{StaticResource MutedText}" Text="$(X 'Useful before you change settings or install something yourself. Needs administrator rights.')"/>
+                  <Button x:Name="BtnRestoreNow" HorizontalAlignment="Left" Margin="0,12,0,0" Content="$(X 'Create a restore point')"/>
+                </StackPanel>
+              </Border>
+            </StackPanel>
+          </ScrollViewer>
+"@
+    Init = {
+        $ui.ChkRestoreBefore.Add_Click({ Set-RestoreBefore })
+        $ui.BtnRestoreNow.Add_Click({ Start-RestorePointTask })
+    }
+}
 Register-Feature @{ Name = 'Power';   Section = 'settings'; Order = 30; Glyph = 'E7F8'; Title = 'Lid and sign-in'; Desc = (T 'Choose what closing the lid does and when a password is needed.'); Open = { Open-Power } }
 Register-Feature @{ Name = 'Info';    Section = 'info';     Order = 10; Glyph = 'E7F4'; Title = 'About this PC';   Desc = (T 'Model, Windows version, memory and disks. Handy for IT support.'); Open = { Open-Info } }
 Register-Feature @{ Name = 'WU';      Section = 'info';     Order = 90; Glyph = 'E713'; Title = 'Windows Update';  Desc = (T 'Open the Windows Update page in Settings.'); Open = { Start-Process 'ms-settings:windowsupdate' } }
 
-# Core Norwegian text, then the feature files (each adds its own strings and registers itself)
-$LangFile = Join-Path $AppDir 'lang\nb.ps1'
-if (Test-Path $LangFile) { . $LangFile }
+# Feature files (each adds its own Norwegian strings and registers itself)
 foreach ($f in @(Get-ChildItem (Join-Path $AppDir 'features') -Filter *.ps1 -ErrorAction SilentlyContinue | Sort-Object Name)) {
     . $f.FullName
 }
@@ -1746,6 +1784,7 @@ function Show-Dialog {
         [string[]]$Buttons = @('OK'),
         [ValidateSet('info', 'question', 'warn', 'error', 'shield', 'ok')][string]$Icon = 'info',
         [string]$CheckBox,
+        [bool]$CheckBoxChecked = $true,
         [object[]]$Items,
         [scriptblock]$ItemLabel = { param($i) "$i" }
     )
@@ -1791,7 +1830,8 @@ function Show-Dialog {
     $chk = $null
     if ($CheckBox) {
         $chk = New-Object System.Windows.Controls.CheckBox
-        $chk.Content = T $CheckBox; $chk.IsChecked = $true; $chk.Margin = '0,14,0,0'
+        $chk.Content = New-Object System.Windows.Controls.TextBlock -Property @{ Text = (T $CheckBox); TextWrapping = 'Wrap' }
+        $chk.IsChecked = $CheckBoxChecked; $chk.Margin = '0,14,0,0'
         [void]$body.Children.Add($chk)
     }
     for ($i = 0; $i -lt $Buttons.Count; $i++) {
@@ -2285,14 +2325,19 @@ function Invoke-RestoreStage {
             return
         }
         Add-TaskLog "[!] Restore point: $($r.Detail)"
+        $never = "Don't try to create restore points again (for example on a work PC where they aren't allowed)"
         if (-not $script:Ctx.RestoreRetried) {
             $d = Show-Dialog -Title (T "Couldn't create a restore point") -Icon warn `
                 -Message (T 'A restore point lets you undo system changes if an update causes problems. System Protection may be turned off on this PC.') `
-                -Buttons 'Turn it on and try again', 'Continue without', 'Stop'
+                -Buttons 'Turn it on and try again', 'Continue without', 'Stop' -CheckBox $never -CheckBoxChecked $false
         } else {
             $d = Show-Dialog -Title (T 'Still no restore point') -Icon warn `
                 -Message (T 'Windows still could not create a restore point. You can continue without one or stop here.') `
-                -Buttons 'Continue without', 'Stop'
+                -Buttons 'Continue without', 'Stop' -CheckBox $never -CheckBoxChecked $false
+        }
+        if ($d.Checked -and $d.Button -ne 'Turn it on and try again') {
+            Set-AppSetting 'SkipRestorePoint' 1
+            Add-TaskLog (T 'Restore points are turned off. You can turn them back on under Restore point.')
         }
         switch ($d.Button) {
             'Turn it on and try again' {
@@ -2316,7 +2361,7 @@ function Invoke-RestoreStage {
 function Invoke-ReinstallOfferStage {
     $failed = @($script:Ctx.Failed)
     if (-not $failed.Count) { Invoke-NextStage; return }
-    $d = Show-Dialog -Title "Some apps couldn't be updated" -Icon warn `
+    $d = Show-Dialog -Title (T "Some apps couldn't be updated") -Icon warn `
         -Message (T 'Reinstalling usually fixes this: the app is removed and the newest version is installed fresh. Settings are normally kept, but close these apps first.') `
         -Items $failed -ItemLabel { param($p) (T '{0}  ({1} to {2})') -f $p.Name, $p.Version, $p.Available } `
         -Buttons 'Reinstall selected', 'Skip'
@@ -2342,19 +2387,25 @@ function Start-UpdateEverything {
         if ($d.Button -eq 'Run as administrator') { Restart-AsAdmin; return }
         if ($d.Button -ne 'Continue anyway') { return }
     } else {
-        $d = Show-Dialog -Title (T 'Update everything?') -Icon question `
-            -Message (T "This updates your apps, Windows (including drivers), Microsoft Store apps, Office and virus protection. A restore point is created first so system changes can be undone.`n`nSome apps may close while they update, so save your work first. This can take a while, but you can keep using your PC.") `
-            -Buttons 'Start', 'Cancel'
+        $msg = if (Test-RestorePointsWanted) {
+            T "This updates your apps, Windows (including drivers), Microsoft Store apps, Office and virus protection. A restore point is created first so system changes can be undone.`n`nSome apps may close while they update, so save your work first. This can take a while, but you can keep using your PC."
+        } else {
+            T "This updates your apps, Windows (including drivers), Microsoft Store apps, Office and virus protection.`n`nSome apps may close while they update, so save your work first. This can take a while, but you can keep using your PC."
+        }
+        $d = Show-Dialog -Title (T 'Update everything?') -Icon question -Message $msg -Buttons 'Start', 'Cancel'
         if ($d.Button -ne 'Start') { return }
     }
 
     $script:Ctx = @{ Failed = @(); Retired = @() }
     Open-TaskPage (T 'Updating everything') (T 'This can take 10 to 60 minutes. You can keep using your PC in the meantime.')
-    Add-TaskStep 'restore' (T 'Safety restore point')
+    $restore = Test-RestorePointsWanted   # off in settings or blocked by the organization: no step at all
+    if ($restore) { Add-TaskStep 'restore' (T 'Safety restore point') }
     foreach ($s in $UpdateSteps) { Add-TaskStep $s.Key $s.Label }
 
     $stages = @()
-    if ($admin) { $stages += { Invoke-RestoreStage } } else { Set-StepState 'restore' 'skip' (T 'Needs administrator') }
+    if ($restore) {
+        if ($admin) { $stages += { Invoke-RestoreStage } } else { Set-StepState 'restore' 'skip' (T 'Needs administrator') }
+    }
     $stages += { Invoke-UpdateAllStage }, { Invoke-ReinstallOfferStage }, { Invoke-RetiredModulesStage }, { Complete-Task }
     Start-Flow $stages
 }
@@ -2494,7 +2545,7 @@ function Start-AppUpdates {
     $admin = Test-IsAdmin
     $what = if ($pkgs.Count -eq 1) { $pkgs[0].Name } else { (T '{0} apps') -f $pkgs.Count }
     $msg = (T 'Apps that are open may close for a moment while they update, so save your work first.')
-    if ($admin) {
+    if ($admin -and (Test-RestorePointsWanted)) {
         $d = Show-Dialog -Title ((T 'Update {0}?') -f $what) -Message $msg -Buttons 'Update', 'Cancel' -Icon question -CheckBox (T 'Create a restore point first (recommended)')
     } else {
         $d = Show-Dialog -Title ((T 'Update {0}?') -f $what) -Message $msg -Buttons 'Update', 'Cancel' -Icon question
@@ -2504,7 +2555,7 @@ function Start-AppUpdates {
     $script:Ctx = @{ Pkgs = $pkgs; IncludeUnknown = [bool]$ui.ChkAppsUnknown.IsChecked; Failed = @() }
     Open-TaskPage (T 'Updating apps') (T 'Apps may close for a moment while they update.') 'Apps'
     $stages = @()
-    if ($admin -and $d.Checked) { Add-TaskStep 'restore' (T 'Safety restore point'); $stages += { Invoke-RestoreStage } }
+    if ($admin -and $d.Checked -and (Test-RestorePointsWanted)) { Add-TaskStep 'restore' (T 'Safety restore point'); $stages += { Invoke-RestoreStage } }
     foreach ($p in $pkgs) { Add-TaskStep $p.Id $p.Name }
     $stages += { Invoke-AppUpgradeStage }, { Invoke-ReinstallOfferStage }, { Complete-Task }
     Start-Flow $stages
@@ -2928,6 +2979,33 @@ function Show-Info($s, $err) {
 
 #region ---------- Restore point ----------
 
+# Restore points are often blocked on work PCs (group policy), and creating one needs administrator rights.
+function Test-RestorePolicyBlocked {
+    $p = Get-ItemProperty 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\SystemRestore' -ErrorAction SilentlyContinue
+    [bool]($p -and ($p.DisableSR -eq 1 -or $p.DisableConfig -eq 1))
+}
+
+# Should "Update everything" / app updates create (and ask about) a restore point?
+function Test-RestorePointsWanted {
+    if ([int](Get-AppSetting 'SkipRestorePoint' 0)) { return $false }
+    -not (Test-RestorePolicyBlocked)
+}
+
+function Open-Restore {
+    Show-Page 'PanelRestore' (T 'Restore point') (T 'A safety snapshot of Windows settings and system files, so system changes can be undone.')
+    $blocked = Test-RestorePolicyBlocked
+    $ui.ChkRestoreBefore.IsChecked = (-not [int](Get-AppSetting 'SkipRestorePoint' 0)) -and -not $blocked
+    $ui.ChkRestoreBefore.IsEnabled = -not $blocked
+    $ui.BtnRestoreNow.IsEnabled = -not $blocked
+    $ui.RestoreBlocked.Visibility = if ($blocked) { 'Visible' } else { 'Collapsed' }
+}
+
+function Set-RestoreBefore {
+    $on = [bool]$ui.ChkRestoreBefore.IsChecked
+    Set-AppSetting 'SkipRestorePoint' ([int](-not $on))
+    Add-History -Title $(if ($on) { T 'Restore points before updates turned on' } else { T 'Restore points before updates turned off' }) -State info
+}
+
 function Start-RestorePointTask {
     if (-not (Confirm-Admin (T 'Creating a restore point'))) { return }
     $d = Show-Dialog -Title (T 'Create a restore point?') -Icon question `
@@ -2935,7 +3013,7 @@ function Start-RestorePointTask {
         -Buttons 'Create', 'Cancel'
     if ($d.Button -ne 'Create') { return }
     $script:Ctx = @{}
-    Open-TaskPage (T 'Creating a restore point') ''
+    Open-TaskPage (T 'Creating a restore point') '' 'Restore'
     Add-TaskStep 'restore' (T 'Restore point')
     Start-Flow @({ Invoke-RestoreStage }, { Complete-Task })
 }
